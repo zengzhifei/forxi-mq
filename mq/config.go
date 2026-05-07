@@ -31,8 +31,9 @@ type Config struct {
 	DelayPollInterval time.Duration // delay queue poll interval (default: 500ms)
 	RecoveryInterval  time.Duration // pending recovery interval (default: 15s)
 
-	// Stream trimming
-	StreamMaxLen int64 // MAXLEN~ trim (default: 0 = unlimited)
+	// Stream trimming (two strategies, can be used together)
+	StreamMaxLen int64         // MAXLEN~ trim by count (default: 0 = unlimited)
+	Retention    time.Duration // MINID trim by time (default: 0 = unlimited)
 }
 
 // defaultConsumerName returns a unique consumer name from environment.

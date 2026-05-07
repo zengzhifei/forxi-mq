@@ -2,6 +2,7 @@ package fxmq
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -9,6 +10,7 @@ import (
 	"github.com/zengzhifei/forxi-mq/consumer"
 	"github.com/zengzhifei/forxi-mq/deadletter"
 	"github.com/zengzhifei/forxi-mq/delay"
+	"github.com/zengzhifei/forxi-mq/internal"
 	"github.com/zengzhifei/forxi-mq/log"
 	"github.com/zengzhifei/forxi-mq/mq"
 	"github.com/zengzhifei/forxi-mq/producer"
@@ -52,6 +54,12 @@ func WithAckTimeout(d time.Duration) Option {
 // WithStreamMaxLen sets the stream MAXLEN~ trimming (default: 0 = unlimited).
 func WithStreamMaxLen(n int64) Option {
 	return func(e *Engine) { e.cfg.StreamMaxLen = n }
+}
+
+// WithRetention sets time-based retention. Messages older than this are trimmed.
+// Uses XTRIM MINID (Redis 6.2+). Default: 0 = keep forever.
+func WithRetention(d time.Duration) Option {
+	return func(e *Engine) { e.cfg.Retention = d }
 }
 
 // WithRedisPassword sets the Redis password.
@@ -165,7 +173,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic string, handler Handler) e
 	return e.Consumer.Subscribe(ctx, topic, handler)
 }
 
-// Start launches background goroutines (delay poller, pending recovery).
+// Start launches background goroutines (delay poller, pending recovery, retention trimmer).
 // Must be called after all Subscribe() calls.
 func (e *Engine) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -177,7 +185,45 @@ func (e *Engine) Start(ctx context.Context) {
 	e.recovery = recovery.New(e.rdb, e.cfg, e.topics, e.logger, e.Retry, e.DLQ)
 	go e.recovery.Run(ctx)
 
+	if e.cfg.Retention > 0 {
+		go e.runRetentionTrimmer(ctx)
+	}
+
 	e.logger.Info("engine started", "topics", e.topics)
+}
+
+// runRetentionTrimmer periodically trims streams using MINID based on retention duration.
+func (e *Engine) runRetentionTrimmer(ctx context.Context) {
+	// Trim every 1/10 of retention period, minimum 1 minute
+	interval := e.cfg.Retention / 10
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.trimByRetention(ctx)
+		}
+	}
+}
+
+func (e *Engine) trimByRetention(ctx context.Context) {
+	minID := strconv.FormatInt(time.Now().Add(-e.cfg.Retention).UnixMilli(), 10) + "-0"
+
+	for _, topic := range e.topics {
+		stream := internal.StreamKey(topic)
+		err := e.rdb.XTrimMinID(ctx, stream, minID).Err()
+		if err != nil {
+			e.logger.Error("retention trim failed",
+				"stream", stream, "min_id", minID, "error", err)
+		}
+	}
 }
 
 // Shutdown gracefully stops all consumers and background tasks.
