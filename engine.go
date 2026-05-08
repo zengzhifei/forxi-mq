@@ -7,6 +7,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/zengzhifei/forxi-mq/alert"
 	"github.com/zengzhifei/forxi-mq/consumer"
 	"github.com/zengzhifei/forxi-mq/dashboard"
 	"github.com/zengzhifei/forxi-mq/deadletter"
@@ -21,9 +22,10 @@ import (
 
 // Re-export core types for convenience.
 type (
-	Message = mq.Message
-	Config  = mq.Config
-	Handler = consumer.Handler
+	Message     = mq.Message
+	Config      = mq.Config
+	Handler     = consumer.Handler
+	AlertConfig = alert.Config
 )
 
 // Re-export constructor.
@@ -91,6 +93,11 @@ func WithDashboard(addr string) Option {
 	return func(e *Engine) { e.dashboardAddr = addr }
 }
 
+// WithAlert enables webhook alerting when metrics exceed thresholds.
+func WithAlert(cfg alert.Config) Option {
+	return func(e *Engine) { e.alertCfg = &cfg }
+}
+
 // Engine is the top-level entry point that wires all components together.
 type Engine struct {
 	rdb     *redis.Client
@@ -106,6 +113,7 @@ type Engine struct {
 	delayPoller   *delay.Poller
 	recovery      *recovery.Recovery
 	dashboardAddr string
+	alertCfg      *alert.Config
 	cancel        context.CancelFunc
 	topics        []string
 }
@@ -199,6 +207,11 @@ func (e *Engine) Start(ctx context.Context) {
 	if e.dashboardAddr != "" {
 		dash := dashboard.New(e.rdb, e.dashboardAddr, e.logger)
 		dash.Start(ctx)
+	}
+
+	if e.alertCfg != nil {
+		alerter := alert.New(e.rdb, e.topics, *e.alertCfg, e.logger)
+		go alerter.Run(ctx)
 	}
 
 	e.logger.Info("engine started", "topics", e.topics)
