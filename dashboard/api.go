@@ -23,17 +23,19 @@ type overviewResp struct {
 }
 
 type topicInfo struct {
-	Name      string      `json:"name"`
-	Length    int64       `json:"length"`
-	Pending   int64       `json:"pending"`
-	Dead      int64       `json:"dead"`
-	Delay     int64       `json:"delay"`
-	Groups    []groupInfo `json:"groups,omitempty"`
+	Name    string      `json:"name"`
+	Stored  int64       `json:"stored"`
+	Lag     int64       `json:"lag"`
+	Pending int64       `json:"pending"`
+	Dead    int64       `json:"dead"`
+	Delay   int64       `json:"delay"`
+	Groups  []groupInfo `json:"groups,omitempty"`
 }
 
 type groupInfo struct {
 	Name      string         `json:"name"`
 	Pending   int64          `json:"pending"`
+	Lag       int64          `json:"lag"`
 	Consumers []consumerInfo `json:"consumers,omitempty"`
 }
 
@@ -99,6 +101,7 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 			gi := groupInfo{
 				Name:    g.Name,
 				Pending: g.Pending,
+				Lag:     g.Lag,
 			}
 			consumers, err := s.rdb.XInfoConsumers(ctx, internal.StreamKey(topic), g.Name).Result()
 			if err == nil {
@@ -115,6 +118,89 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, info)
+}
+
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+
+	count := int64(50)
+	if c := r.URL.Query().Get("count"); c != "" {
+		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
+			count = n
+		}
+	}
+
+	// XREVRANGE returns latest messages first
+	msgs, err := s.rdb.XRevRangeN(ctx, internal.StreamKey(topic), "+", "-", count).Result()
+	if err != nil {
+		writeJSON(w, []map[string]any{})
+		return
+	}
+
+	var result []map[string]any
+	for _, msg := range msgs {
+		item := map[string]any{
+			"id":     msg.ID,
+			"values": msg.Values,
+		}
+		result = append(result, item)
+	}
+
+	writeJSON(w, result)
+}
+
+func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+	streamKey := internal.StreamKey(topic)
+
+	count := int64(50)
+	if c := r.URL.Query().Get("count"); c != "" {
+		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
+			count = n
+		}
+	}
+
+	// Get all groups, then get pending messages from each
+	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
+	if err != nil {
+		writeJSON(w, []map[string]any{})
+		return
+	}
+
+	var result []map[string]any
+	for _, g := range groups {
+		pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: streamKey,
+			Group:  g.Name,
+			Start:  "-",
+			End:    "+",
+			Count:  count,
+		}).Result()
+		if err != nil {
+			continue
+		}
+
+		// Fetch message bodies
+		for _, p := range pending {
+			msgs, err := s.rdb.XRangeN(ctx, streamKey, p.ID, p.ID, 1).Result()
+			if err != nil || len(msgs) == 0 {
+				continue
+			}
+			item := map[string]any{
+				"id":        p.ID,
+				"group":     g.Name,
+				"consumer":  p.Consumer,
+				"idle":      p.Idle.String(),
+				"retry_count": p.RetryCount,
+				"values":    msgs[0].Values,
+			}
+			result = append(result, item)
+		}
+	}
+
+	writeJSON(w, result)
 }
 
 func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
@@ -266,18 +352,20 @@ func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
 	dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
 	delayCount, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
 
-	// Sum pending across all groups
-	var pending int64
+	// Sum pending and lag across all groups
+	var pending, lag int64
 	groups, err := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
 	if err == nil {
 		for _, g := range groups {
 			pending += g.Pending
+			lag += g.Lag
 		}
 	}
 
 	return topicInfo{
 		Name:    topic,
-		Length:  length,
+		Stored:  length,
+		Lag:     lag,
 		Pending: pending,
 		Dead:    dead,
 		Delay:   delayCount,

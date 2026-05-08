@@ -39,6 +39,8 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("GET /api/overview", s.handleOverview)
 	mux.HandleFunc("GET /api/topics", s.handleTopics)
 	mux.HandleFunc("GET /api/topics/{topic}", s.handleTopicDetail)
+	mux.HandleFunc("GET /api/topics/{topic}/messages", s.handleMessages)
+	mux.HandleFunc("GET /api/topics/{topic}/pending", s.handlePending)
 	mux.HandleFunc("GET /api/topics/{topic}/dead", s.handleDeadLetters)
 	mux.HandleFunc("POST /api/topics/{topic}/dead/requeue", s.handleRequeue)
 	mux.HandleFunc("GET /api/topics/{topic}/delay", s.handleDelayQueue)

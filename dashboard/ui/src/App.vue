@@ -105,9 +105,15 @@ onUnmounted(() => {
           </template>
           <el-table :data="topics" stripe style="width: 100%" @row-click="selectTopic">
             <el-table-column prop="name" label="Topic" />
-            <el-table-column prop="length" label="Length">
+            <el-table-column prop="stored" label="Stored">
               <template #default="{ row }">
-                {{ row.length.toLocaleString() }}
+                {{ (row.stored || 0).toLocaleString() }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="lag" label="Lag">
+              <template #default="{ row }">
+                <el-tag v-if="row.lag > 0" type="danger" size="small">{{ row.lag }}</el-tag>
+                <el-tag v-else type="success" size="small">0</el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="pending" label="Pending">
