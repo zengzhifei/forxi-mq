@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,11 +23,17 @@ type overviewResp struct {
 }
 
 type topicInfo struct {
-	Name      string       `json:"name"`
-	Length    int64        `json:"length"`
-	Pending   int64        `json:"pending"`
-	Dead      int64        `json:"dead"`
-	Delay     int64        `json:"delay"`
+	Name      string      `json:"name"`
+	Length    int64       `json:"length"`
+	Pending   int64       `json:"pending"`
+	Dead      int64       `json:"dead"`
+	Delay     int64       `json:"delay"`
+	Groups    []groupInfo `json:"groups,omitempty"`
+}
+
+type groupInfo struct {
+	Name      string         `json:"name"`
+	Pending   int64          `json:"pending"`
 	Consumers []consumerInfo `json:"consumers,omitempty"`
 }
 
@@ -52,9 +59,10 @@ type delayMessage struct {
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	resp := overviewResp{Topics: len(s.topics)}
+	topics := s.discoverTopics(ctx)
+	resp := overviewResp{Topics: len(topics)}
 
-	for _, topic := range s.topics {
+	for _, topic := range topics {
 		length, _ := s.rdb.XLen(ctx, internal.StreamKey(topic)).Result()
 		dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
 		delay, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
@@ -68,9 +76,10 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	discovered := s.discoverTopics(ctx)
 	var topics []topicInfo
 
-	for _, topic := range s.topics {
+	for _, topic := range discovered {
 		info := s.getTopicInfo(ctx, topic)
 		topics = append(topics, info)
 	}
@@ -83,15 +92,25 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	info := s.getTopicInfo(ctx, topic)
 
-	// Get consumer details
-	consumers, err := s.rdb.XInfoConsumers(ctx, internal.StreamKey(topic), s.group).Result()
+	// Get all groups and their consumers
+	groups, err := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
 	if err == nil {
-		for _, c := range consumers {
-			info.Consumers = append(info.Consumers, consumerInfo{
-				Name:    c.Name,
-				Pending: c.Pending,
-				Idle:    c.Idle.String(),
-			})
+		for _, g := range groups {
+			gi := groupInfo{
+				Name:    g.Name,
+				Pending: g.Pending,
+			}
+			consumers, err := s.rdb.XInfoConsumers(ctx, internal.StreamKey(topic), g.Name).Result()
+			if err == nil {
+				for _, c := range consumers {
+					gi.Consumers = append(gi.Consumers, consumerInfo{
+						Name:    c.Name,
+						Pending: c.Pending,
+						Idle:    c.Idle.String(),
+					})
+				}
+			}
+			info.Groups = append(info.Groups, gi)
 		}
 	}
 
@@ -190,15 +209,70 @@ func (s *Server) handleDelayQueue(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
+// discoverTopics scans Redis for all fxmq:* keys and extracts topic names.
+func (s *Server) discoverTopics(ctx context.Context) []string {
+	seen := make(map[string]bool)
+
+	var cursor uint64
+	for {
+		keys, next, err := s.rdb.Scan(ctx, cursor, "fxmq:*", 100).Result()
+		if err != nil {
+			break
+		}
+		for _, key := range keys {
+			topic := extractTopic(key)
+			if topic != "" && !seen[topic] {
+				seen[topic] = true
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
+	topics := make([]string, 0, len(seen))
+	for t := range seen {
+		topics = append(topics, t)
+	}
+	return topics
+}
+
+// extractTopic extracts the topic name from a Redis key.
+// fxmq:{topic}         → {topic}
+// fxmq:dead:{topic}    → {topic}
+// fxmq:delay:{topic}   → {topic}
+// fxmq:retry:{topic}:* → (ignored, too granular)
+func extractTopic(key string) string {
+	parts := strings.TrimPrefix(key, "fxmq:")
+
+	if strings.HasPrefix(parts, "dead:") {
+		return strings.TrimPrefix(parts, "dead:")
+	}
+	if strings.HasPrefix(parts, "delay:") {
+		return strings.TrimPrefix(parts, "delay:")
+	}
+	if strings.HasPrefix(parts, "retry:") {
+		// retry keys are fxmq:retry:{topic}:{msgID}, skip them
+		return ""
+	}
+
+	// Direct stream key: fxmq:{topic}
+	return parts
+}
+
 func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
 	length, _ := s.rdb.XLen(ctx, internal.StreamKey(topic)).Result()
 	dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
 	delayCount, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
 
+	// Sum pending across all groups
 	var pending int64
-	pendingInfo, err := s.rdb.XPending(ctx, internal.StreamKey(topic), s.group).Result()
+	groups, err := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
 	if err == nil {
-		pending = pendingInfo.Count
+		for _, g := range groups {
+			pending += g.Pending
+		}
 	}
 
 	return topicInfo{

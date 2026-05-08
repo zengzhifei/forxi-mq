@@ -17,19 +17,15 @@ var staticFiles embed.FS
 // Server is the dashboard HTTP server.
 type Server struct {
 	rdb    *redis.Client
-	group  string
-	topics []string
 	logger log.Logger
 	addr   string
 	srv    *http.Server
 }
 
 // New creates a new dashboard Server.
-func New(rdb *redis.Client, group string, topics []string, addr string, logger log.Logger) *Server {
+func New(rdb *redis.Client, addr string, logger log.Logger) *Server {
 	return &Server{
 		rdb:    rdb,
-		group:  group,
-		topics: topics,
 		logger: logger,
 		addr:   addr,
 	}

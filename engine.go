@@ -197,7 +197,7 @@ func (e *Engine) Start(ctx context.Context) {
 	}
 
 	if e.dashboardAddr != "" {
-		dash := dashboard.New(e.rdb, e.cfg.Group, e.topics, e.dashboardAddr, e.logger)
+		dash := dashboard.New(e.rdb, e.dashboardAddr, e.logger)
 		dash.Start(ctx)
 	}
 
