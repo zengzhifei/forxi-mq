@@ -63,3 +63,10 @@ func (s *Strategy) GetCount(ctx context.Context, topic, msgID string) (int, erro
 	}
 	return strconv.Atoi(val)
 }
+
+// Increment bumps the retry counter by 1 (used by recovery).
+func (s *Strategy) Increment(ctx context.Context, topic, msgID string) {
+	key := internal.RetryCountKey(topic, msgID)
+	s.rdb.Incr(ctx, key)
+	s.rdb.Expire(ctx, key, time.Hour)
+}

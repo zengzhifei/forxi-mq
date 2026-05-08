@@ -99,10 +99,15 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 			continue
 		}
 
+		// Increment retry count on each recovery claim
+		count++
+		r.retry.Increment(ctx, topic, xmsg.ID)
+
 		if count >= r.maxRetry {
-			_ = r.dlq.Push(ctx, &msg, "recovered but max retries exceeded")
+			_ = r.dlq.Push(ctx, &msg, "max retries exceeded (timeout)")
 			r.ack(ctx, stream, xmsg.ID)
 			r.retry.Clear(ctx, topic, xmsg.ID)
+			r.logger.Info("message moved to DLQ", "topic", topic, "msg_id", xmsg.ID, "retries", count)
 		}
 		// Otherwise the message is now assigned to this consumer
 		// and will be re-delivered via XREADGROUP on next read cycle.
