@@ -8,6 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/consumer"
+	"github.com/zengzhifei/forxi-mq/dashboard"
 	"github.com/zengzhifei/forxi-mq/deadletter"
 	"github.com/zengzhifei/forxi-mq/delay"
 	"github.com/zengzhifei/forxi-mq/internal"
@@ -85,6 +86,11 @@ func WithRedisClient(rdb *redis.Client) Option {
 	}
 }
 
+// WithDashboard enables the web dashboard on the given address (e.g. ":9090").
+func WithDashboard(addr string) Option {
+	return func(e *Engine) { e.dashboardAddr = addr }
+}
+
 // Engine is the top-level entry point that wires all components together.
 type Engine struct {
 	rdb     *redis.Client
@@ -97,10 +103,11 @@ type Engine struct {
 	DLQ      *deadletter.Queue
 	Retry    *retry.Strategy
 
-	delayPoller *delay.Poller
-	recovery    *recovery.Recovery
-	cancel      context.CancelFunc
-	topics      []string
+	delayPoller   *delay.Poller
+	recovery      *recovery.Recovery
+	dashboardAddr string
+	cancel        context.CancelFunc
+	topics        []string
 }
 
 // NewEngine creates a new Engine.
@@ -187,6 +194,11 @@ func (e *Engine) Start(ctx context.Context) {
 
 	if e.cfg.Retention > 0 {
 		go e.runRetentionTrimmer(ctx)
+	}
+
+	if e.dashboardAddr != "" {
+		dash := dashboard.New(e.rdb, e.cfg.Group, e.topics, e.dashboardAddr, e.logger)
+		dash.Start(ctx)
 	}
 
 	e.logger.Info("engine started", "topics", e.topics)
