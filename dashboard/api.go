@@ -124,17 +124,23 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 
-	count := int64(50)
+	count := int64(20)
 	if c := r.URL.Query().Get("count"); c != "" {
 		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
 			count = n
 		}
 	}
 
-	// XREVRANGE returns latest messages first
-	msgs, err := s.rdb.XRevRangeN(ctx, internal.StreamKey(topic), "+", "-", count).Result()
+	// Cursor-based pagination: cursor is the last ID from previous page
+	// For XREVRANGE, cursor means "get messages before this ID"
+	end := "+"
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		end = "(" + cursor // exclusive
+	}
+
+	msgs, err := s.rdb.XRevRangeN(ctx, internal.StreamKey(topic), end, "-", count).Result()
 	if err != nil {
-		writeJSON(w, []map[string]any{})
+		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
 		return
 	}
 
@@ -147,7 +153,73 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		result = append(result, item)
 	}
 
-	writeJSON(w, result)
+	var nextCursor string
+	if int64(len(result)) == count && len(result) > 0 {
+		nextCursor = result[len(result)-1]["id"].(string)
+	}
+
+	writeJSON(w, map[string]any{"items": result, "next_cursor": nextCursor})
+}
+
+func (s *Server) handleLag(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+	streamKey := internal.StreamKey(topic)
+
+	count := int64(20)
+	if c := r.URL.Query().Get("count"); c != "" {
+		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
+			count = n
+		}
+	}
+
+	// Find the last-delivered-id across all groups (use the smallest one)
+	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
+	if err != nil || len(groups) == 0 {
+		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
+		return
+	}
+
+	// Get the earliest last-delivered-id (messages after this are "lag")
+	lastID := groups[0].LastDeliveredID
+	for _, g := range groups[1:] {
+		if g.LastDeliveredID < lastID {
+			lastID = g.LastDeliveredID
+		}
+	}
+
+	// Cursor-based pagination for lag
+	start := lastID
+	if start == "0-0" {
+		start = "-"
+	} else {
+		start = "(" + start
+	}
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		start = "(" + cursor
+	}
+
+	msgs, err := s.rdb.XRangeN(ctx, streamKey, start, "+", count).Result()
+	if err != nil {
+		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
+		return
+	}
+
+	var result []map[string]any
+	for _, msg := range msgs {
+		item := map[string]any{
+			"id":     msg.ID,
+			"values": msg.Values,
+		}
+		result = append(result, item)
+	}
+
+	var nextCursor string
+	if int64(len(result)) == count && len(result) > 0 {
+		nextCursor = result[len(result)-1]["id"].(string)
+	}
+
+	writeJSON(w, map[string]any{"items": result, "next_cursor": nextCursor})
 }
 
 func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
@@ -155,17 +227,23 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	streamKey := internal.StreamKey(topic)
 
-	count := int64(50)
+	count := int64(20)
 	if c := r.URL.Query().Get("count"); c != "" {
 		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
 			count = n
 		}
 	}
 
+	// Cursor: start from after this ID
+	startID := "-"
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		startID = "(" + cursor
+	}
+
 	// Get all groups, then get pending messages from each
 	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
 	if err != nil {
-		writeJSON(w, []map[string]any{})
+		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
 		return
 	}
 
@@ -174,7 +252,7 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 		pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: streamKey,
 			Group:  g.Name,
-			Start:  "-",
+			Start:  startID,
 			End:    "+",
 			Count:  count,
 		}).Result()
@@ -189,34 +267,44 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			item := map[string]any{
-				"id":        p.ID,
-				"group":     g.Name,
-				"consumer":  p.Consumer,
-				"idle":      p.Idle.String(),
+				"id":          p.ID,
+				"group":       g.Name,
+				"consumer":    p.Consumer,
+				"idle":        p.Idle.String(),
 				"retry_count": p.RetryCount,
-				"values":    msgs[0].Values,
+				"values":      msgs[0].Values,
 			}
 			result = append(result, item)
 		}
 	}
 
-	writeJSON(w, result)
+	var nextCursor string
+	if int64(len(result)) >= count && len(result) > 0 {
+		nextCursor = result[len(result)-1]["id"].(string)
+	}
+
+	writeJSON(w, map[string]any{"items": result, "next_cursor": nextCursor})
 }
 
 func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 
-	count := int64(50)
+	count := int64(20)
 	if c := r.URL.Query().Get("count"); c != "" {
 		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
 			count = n
 		}
 	}
 
-	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), "-", "+", count).Result()
+	start := "-"
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		start = "(" + cursor
+	}
+
+	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), start, "+", count).Result()
 	if err != nil {
-		writeJSON(w, []deadMessage{})
+		writeJSON(w, map[string]any{"items": []deadMessage{}, "next_cursor": ""})
 		return
 	}
 
@@ -232,7 +320,12 @@ func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
 		result = append(result, dm)
 	}
 
-	writeJSON(w, result)
+	var nextCursor string
+	if int64(len(result)) == count && len(result) > 0 {
+		nextCursor = result[len(result)-1].ID
+	}
+
+	writeJSON(w, map[string]any{"items": result, "next_cursor": nextCursor})
 }
 
 func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
@@ -268,13 +361,51 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int{"requeued": count})
 }
 
+func (s *Server) handleResend(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+
+	var req struct {
+		Body string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	err := s.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: internal.StreamKey(topic),
+		Values: map[string]interface{}{"body": req.Body},
+	}).Err()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleDelayQueue(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 
-	results, err := s.rdb.ZRangeWithScores(ctx, internal.DelayKey(topic), 0, 49).Result()
+	count := int64(20)
+	if c := r.URL.Query().Get("count"); c != "" {
+		if n, err := strconv.ParseInt(c, 10, 64); err == nil {
+			count = n
+		}
+	}
+
+	offset := int64(0)
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if n, err := strconv.ParseInt(o, 10, 64); err == nil {
+			offset = n
+		}
+	}
+
+	results, err := s.rdb.ZRangeWithScores(ctx, internal.DelayKey(topic), offset, offset+count-1).Result()
 	if err != nil {
-		writeJSON(w, []delayMessage{})
+		writeJSON(w, map[string]any{"items": []delayMessage{}, "next_offset": 0, "has_more": false})
 		return
 	}
 
@@ -290,7 +421,131 @@ func (s *Server) handleDelayQueue(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, msgs)
+	hasMore := int64(len(msgs)) == count
+	nextOffset := offset + int64(len(msgs))
+
+	writeJSON(w, map[string]any{"items": msgs, "next_offset": nextOffset, "has_more": hasMore})
+}
+
+func (s *Server) handleSearchMessage(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeJSON(w, map[string]any{"found": false})
+		return
+	}
+
+	// Search in main stream
+	msgs, err := s.rdb.XRangeN(ctx, internal.StreamKey(topic), id, id, 1).Result()
+	if err == nil && len(msgs) > 0 {
+		writeJSON(w, map[string]any{
+			"found":  true,
+			"source": "stream",
+			"message": map[string]any{
+				"id":     msgs[0].ID,
+				"values": msgs[0].Values,
+			},
+		})
+		return
+	}
+
+	// Search in dead letter
+	msgs, err = s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), id, id, 1).Result()
+	if err == nil && len(msgs) > 0 {
+		dm := map[string]any{"id": msgs[0].ID}
+		if body, ok := msgs[0].Values["body"].(string); ok {
+			dm["body"] = body
+		}
+		if reason, ok := msgs[0].Values["reason"].(string); ok {
+			dm["reason"] = reason
+		}
+		writeJSON(w, map[string]any{
+			"found":   true,
+			"source":  "dead",
+			"message": dm,
+		})
+		return
+	}
+
+	writeJSON(w, map[string]any{"found": false})
+}
+
+func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+
+	var req struct {
+		Body string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	id, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: internal.StreamKey(topic),
+		Values: map[string]interface{}{"body": req.Body},
+	}).Result()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"ok": true, "id": id})
+}
+
+func (s *Server) handleDeleteDead(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	id := r.PathValue("id")
+	ctx := r.Context()
+
+	err := s.rdb.XDel(ctx, internal.DeadLetterKey(topic), id).Err()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteDelay(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+
+	var req struct {
+		Body string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	err := s.rdb.ZRem(ctx, internal.DelayKey(topic), req.Body).Err()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleResetGroup(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	group := r.PathValue("group")
+	ctx := r.Context()
+
+	var req struct {
+		ID string `json:"id"` // "0" = reset to beginning, "$" = latest
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		req.ID = "0" // default: re-consume all
+	}
+
+	err := s.rdb.XGroupSetID(ctx, internal.StreamKey(topic), group, req.ID).Err()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // --- Helpers ---

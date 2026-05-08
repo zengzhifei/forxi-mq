@@ -2,6 +2,10 @@ html.dark {
   color-scheme: dark;
 }
 
+html:not(.dark) {
+  color-scheme: light;
+}
+
 body {
   margin: 0;
   padding: 0;

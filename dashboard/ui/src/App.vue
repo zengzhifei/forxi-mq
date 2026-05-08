@@ -1,12 +1,30 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { Monitor, Message, Timer, Warning } from '@element-plus/icons-vue'
+import { Monitor, Message, Timer, Warning, Sunny, Moon } from '@element-plus/icons-vue'
 import TopicDetail from './components/TopicDetail.vue'
 
 const overview = ref({ topics: 0, total_msgs: 0, total_dead: 0, total_delay: 0 })
 const topics = ref([])
 const selectedTopic = ref(null)
+const isDark = ref(true)
 let timer = null
+
+function toggleTheme() {
+  isDark.value = !isDark.value
+  document.documentElement.classList.toggle('dark', isDark.value)
+  localStorage.setItem('fxmq-theme', isDark.value ? 'dark' : 'light')
+}
+
+function initTheme() {
+  const saved = localStorage.getItem('fxmq-theme')
+  if (saved === 'light') {
+    isDark.value = false
+    document.documentElement.classList.remove('dark')
+  } else {
+    isDark.value = true
+    document.documentElement.classList.add('dark')
+  }
+}
 
 async function fetchData() {
   try {
@@ -30,6 +48,7 @@ function closeTopic() {
 }
 
 onMounted(() => {
+  initTheme()
   fetchData()
   timer = setInterval(fetchData, 3000)
 })
@@ -40,13 +59,14 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="layout dark">
+  <div class="layout" :class="{ dark: isDark }">
     <el-container>
       <el-header class="header">
         <div class="logo">
           <el-icon :size="24"><Monitor /></el-icon>
           <span>forxi-mq</span>
         </div>
+        <el-button class="theme-btn" :icon="isDark ? Sunny : Moon" circle size="small" @click="toggleTheme" :title="isDark ? '切换亮色' : '切换暗色'" />
       </el-header>
 
       <el-main class="main">
@@ -68,8 +88,8 @@ onUnmounted(() => {
               <div class="stat-card">
                 <el-icon :size="28" color="#67c23a"><Message /></el-icon>
                 <div class="stat-info">
-                  <div class="stat-value">{{ overview.total_msgs.toLocaleString() }}</div>
-                  <div class="stat-label">Total Messages</div>
+                  <div class="stat-value">{{ (overview.total_msgs || 0).toLocaleString() }}</div>
+                  <div class="stat-label">Stored</div>
                 </div>
               </div>
             </el-card>
@@ -104,34 +124,28 @@ onUnmounted(() => {
             <span class="card-title">Topics</span>
           </template>
           <el-table :data="topics" stripe style="width: 100%" @row-click="selectTopic">
-            <el-table-column prop="name" label="Topic" />
-            <el-table-column prop="stored" label="Stored">
+            <el-table-column prop="name" label="Topic" min-width="180" />
+            <el-table-column label="Stored" min-width="100" align="center">
+              <template #default="{ row }">{{ (row.stored || 0).toLocaleString() }}</template>
+            </el-table-column>
+            <el-table-column label="Lag" min-width="80" align="center">
               <template #default="{ row }">
-                {{ (row.stored || 0).toLocaleString() }}
+                <span :class="{ 'num-danger': row.lag > 0 }">{{ row.lag || 0 }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="lag" label="Lag">
+            <el-table-column label="Pending" min-width="80" align="center">
               <template #default="{ row }">
-                <el-tag v-if="row.lag > 0" type="danger" size="small">{{ row.lag }}</el-tag>
-                <el-tag v-else type="success" size="small">0</el-tag>
+                <span :class="{ 'num-warn': row.pending > 0 }">{{ row.pending || 0 }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="pending" label="Pending">
+            <el-table-column label="Dead" min-width="80" align="center">
               <template #default="{ row }">
-                <el-tag v-if="row.pending > 0" type="warning" size="small">{{ row.pending }}</el-tag>
-                <el-tag v-else type="success" size="small">0</el-tag>
+                <span :class="{ 'num-danger': row.dead > 0 }">{{ row.dead || 0 }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="dead" label="Dead">
+            <el-table-column label="Delay" min-width="80" align="center">
               <template #default="{ row }">
-                <el-tag v-if="row.dead > 0" type="danger" size="small">{{ row.dead }}</el-tag>
-                <el-tag v-else type="info" size="small">0</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="delay" label="Delayed">
-              <template #default="{ row }">
-                <el-tag v-if="row.delay > 0" type="warning" size="small">{{ row.delay }}</el-tag>
-                <span v-else>0</span>
+                <span :class="{ 'num-warn': row.delay > 0 }">{{ row.delay || 0 }}</span>
               </template>
             </el-table-column>
           </el-table>
@@ -151,15 +165,41 @@ onUnmounted(() => {
 <style scoped>
 .layout {
   min-height: 100vh;
-  background: #1d1e1f;
-  color: #e5eaf3;
+  background: var(--fxmq-bg);
+  color: var(--fxmq-text);
+  transition: background 0.3s, color 0.3s;
+}
+
+.layout.dark {
+  --fxmq-bg: #1d1e1f;
+  --fxmq-text: #e5eaf3;
+  --fxmq-header-bg: #141414;
+  --fxmq-border: #363637;
+  --fxmq-card-bg: #1d1e1f;
+  --fxmq-table-bg: #1d1e1f;
+  --fxmq-table-header: #141414;
+  --fxmq-table-hover: #262727;
+  --fxmq-muted: #a3a6ad;
+}
+
+.layout:not(.dark) {
+  --fxmq-bg: #f5f7fa;
+  --fxmq-text: #303133;
+  --fxmq-header-bg: #fff;
+  --fxmq-border: #e4e7ed;
+  --fxmq-card-bg: #fff;
+  --fxmq-table-bg: #fff;
+  --fxmq-table-header: #fafafa;
+  --fxmq-table-hover: #f5f7fa;
+  --fxmq-muted: #909399;
 }
 
 .header {
   display: flex;
   align-items: center;
-  border-bottom: 1px solid #363637;
-  background: #141414;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--fxmq-border);
+  background: var(--fxmq-header-bg);
 }
 
 .logo {
@@ -168,7 +208,11 @@ onUnmounted(() => {
   gap: 8px;
   font-size: 18px;
   font-weight: 600;
-  color: #e5eaf3;
+  color: var(--fxmq-text);
+}
+
+.theme-btn {
+  margin-left: auto;
 }
 
 .main {
@@ -197,12 +241,12 @@ onUnmounted(() => {
 .stat-value {
   font-size: 24px;
   font-weight: 700;
-  color: #e5eaf3;
+  color: var(--fxmq-text);
 }
 
 .stat-label {
   font-size: 13px;
-  color: #a3a6ad;
+  color: var(--fxmq-muted);
 }
 
 .table-card {
@@ -215,18 +259,28 @@ onUnmounted(() => {
 }
 
 :deep(.el-card) {
-  background: #1d1e1f;
-  border-color: #363637;
+  background: var(--fxmq-card-bg);
+  border-color: var(--fxmq-border);
 }
 
 :deep(.el-table) {
-  --el-table-bg-color: #1d1e1f;
-  --el-table-tr-bg-color: #1d1e1f;
-  --el-table-header-bg-color: #141414;
-  --el-table-row-hover-bg-color: #262727;
-  --el-table-border-color: #363637;
-  --el-table-text-color: #e5eaf3;
-  --el-table-header-text-color: #a3a6ad;
+  --el-table-bg-color: var(--fxmq-table-bg);
+  --el-table-tr-bg-color: var(--fxmq-table-bg);
+  --el-table-header-bg-color: var(--fxmq-table-header);
+  --el-table-row-hover-bg-color: var(--fxmq-table-hover);
+  --el-table-border-color: var(--fxmq-border);
+  --el-table-text-color: var(--fxmq-text);
+  --el-table-header-text-color: var(--fxmq-muted);
   cursor: pointer;
+}
+
+.num-danger {
+  color: #f56c6c;
+  font-weight: 600;
+}
+
+.num-warn {
+  color: #e6a23c;
+  font-weight: 600;
 }
 </style>
