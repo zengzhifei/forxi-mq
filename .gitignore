@@ -1,0 +1,13 @@
+# Dependencies
+dashboard/ui/node_modules/
+
+# Frontend dev files (dist/ must be committed for go:embed)
+dashboard/ui/.vite/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.sw?
