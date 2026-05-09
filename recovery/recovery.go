@@ -56,7 +56,8 @@ func (r *Recovery) Run(ctx context.Context) {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
-	var tick int
+	cleanEvery := int(5*time.Minute/r.interval) + 1
+	tick := cleanEvery - 1 // trigger cleanup on first tick
 
 	for {
 		select {
@@ -66,9 +67,7 @@ func (r *Recovery) Run(ctx context.Context) {
 			for _, topic := range r.topics {
 				r.recover(ctx, topic)
 			}
-			// Clean stale consumers every ~5 minutes (based on tick count)
 			tick++
-			cleanEvery := int(5*time.Minute/r.interval) + 1
 			if tick%cleanEvery == 0 {
 				for _, topic := range r.topics {
 					r.cleanStaleConsumers(ctx, topic)
