@@ -14,6 +14,11 @@ import (
 	"github.com/zengzhifei/forxi-mq/retry"
 )
 
+// RetryEnqueuer delivers claimed messages to consumer for reprocessing.
+type RetryEnqueuer interface {
+	EnqueueRetry(topic, stream string, xmsg redis.XMessage)
+}
+
 // Recovery periodically claims pending messages that exceeded ACK timeout.
 type Recovery struct {
 	rdb        *redis.Client
@@ -26,10 +31,11 @@ type Recovery struct {
 	logger     log.Logger
 	retry      *retry.Strategy
 	dlq        *deadletter.Queue
+	enqueuer   RetryEnqueuer
 }
 
 // New creates a new Recovery process.
-func New(rdb *redis.Client, cfg mq.Config, topics []string, logger log.Logger, rs *retry.Strategy, dlq *deadletter.Queue) *Recovery {
+func New(rdb *redis.Client, cfg mq.Config, topics []string, logger log.Logger, rs *retry.Strategy, dlq *deadletter.Queue, enqueuer RetryEnqueuer) *Recovery {
 	return &Recovery{
 		rdb:        rdb,
 		group:      cfg.Group,
@@ -41,6 +47,7 @@ func New(rdb *redis.Client, cfg mq.Config, topics []string, logger log.Logger, r
 		logger:     logger,
 		retry:      rs,
 		dlq:        dlq,
+		enqueuer:   enqueuer,
 	}
 }
 
@@ -120,7 +127,8 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 			r.ack(ctx, stream, xmsg.ID)
 			r.logger.Info("message moved to DLQ", "topic", topic, "msg_id", xmsg.ID, "retries", count)
 		} else {
-			// Leave in PEL — worker will pick it up via pending read
+			// Deliver to consumer via channel for reprocessing
+			r.enqueuer.EnqueueRetry(topic, stream, xmsg)
 			r.logger.Info("message claimed for retry", "topic", topic, "msg_id", xmsg.ID, "attempt", count)
 		}
 	}

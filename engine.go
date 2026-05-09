@@ -211,7 +211,7 @@ func (e *Engine) Start(ctx context.Context) {
 		e.delayPoller.Run(ctx)
 	}()
 
-	e.recovery = recovery.New(e.rdb, e.cfg, e.topics, e.logger, e.Retry, e.DLQ)
+	e.recovery = recovery.New(e.rdb, e.cfg, e.topics, e.logger, e.Retry, e.DLQ, e.Consumer)
 	e.bgWg.Add(1)
 	go func() {
 		defer e.bgWg.Done()
