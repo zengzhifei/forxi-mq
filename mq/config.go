@@ -21,8 +21,7 @@ type Config struct {
 	Concurrency int
 
 	// Retry
-	MaxRetry     int           // max retries before DLQ (default: 3)
-	RetryBackoff time.Duration // base backoff duration (default: 2s)
+	MaxRetry int // max retries before DLQ (default: 3)
 
 	// Timeout
 	AckTimeout time.Duration // pending message timeout (default: 60s)
@@ -57,9 +56,6 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.MaxRetry <= 0 {
 		c.MaxRetry = 3
-	}
-	if c.RetryBackoff <= 0 {
-		c.RetryBackoff = 2 * time.Second
 	}
 	if c.AckTimeout <= 0 {
 		c.AckTimeout = 60 * time.Second

@@ -28,3 +28,8 @@ func DelayDataKey(topic string) string {
 func RetryCountKey(topic, msgID string) string {
 	return fmt.Sprintf("%s:retry:%s:%s", prefix, topic, msgID)
 }
+
+// DelayMapKey returns the key that maps a delay ID to its stream ID after delivery.
+func DelayMapKey(topic, delayID string) string {
+	return fmt.Sprintf("%s:delay-map:%s:%s", prefix, topic, delayID)
+}

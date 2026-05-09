@@ -272,11 +272,7 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Get real retry count from forxi-mq retry counter
-			retryKey := p.ID
-			if rk, ok := msgs[0].Values["_retry_key"].(string); ok {
-				retryKey = rk
-			}
-			retryCount, _ := s.rdb.Get(ctx, internal.RetryCountKey(topic, retryKey)).Int()
+			retryCount, _ := s.rdb.Get(ctx, internal.RetryCountKey(topic, p.ID)).Int()
 
 			item := map[string]any{
 				"id":          p.ID,
@@ -454,22 +450,16 @@ func (s *Server) handleSearchMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	streamKey := internal.StreamKey(topic)
+
 	// Search in main stream
-	msgs, err := s.rdb.XRangeN(ctx, internal.StreamKey(topic), id, id, 1).Result()
-	if err == nil && len(msgs) > 0 {
-		writeJSON(w, map[string]any{
-			"found":  true,
-			"source": "stream",
-			"message": map[string]any{
-				"id":     msgs[0].ID,
-				"values": msgs[0].Values,
-			},
-		})
+	if result, ok := s.findInStream(ctx, streamKey, topic, id); ok {
+		writeJSON(w, result)
 		return
 	}
 
 	// Search in dead letter
-	msgs, err = s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), id, id, 1).Result()
+	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), id, id, 1).Result()
 	if err == nil && len(msgs) > 0 {
 		dm := map[string]any{"id": msgs[0].ID}
 		if body, ok := msgs[0].Values["body"].(string); ok {
@@ -481,12 +471,125 @@ func (s *Server) handleSearchMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
 			"found":   true,
 			"source":  "dead",
+			"status":  "dead",
 			"message": dm,
 		})
 		return
 	}
 
+	// Search in delay queue (not yet delivered)
+	dataKey := internal.DelayDataKey(topic)
+	body, err := s.rdb.HGet(ctx, dataKey, id).Result()
+	if err == nil && body != "" {
+		score, _ := s.rdb.ZScore(ctx, internal.DelayKey(topic), id).Result()
+		dueAt := ""
+		if score > 0 {
+			dueAt = time.UnixMilli(int64(score)).Format(time.RFC3339)
+		}
+		writeJSON(w, map[string]any{
+			"found":  true,
+			"source": "delay",
+			"status": "waiting",
+			"message": map[string]any{
+				"id":     id,
+				"body":   body,
+				"due_at": dueAt,
+			},
+		})
+		return
+	}
+
+	// Search via delay-map (delay message already delivered to stream)
+	mapKey := internal.DelayMapKey(topic, id)
+	streamID, err := s.rdb.Get(ctx, mapKey).Result()
+	if err == nil && streamID != "" {
+		if result, ok := s.findInStream(ctx, streamKey, topic, streamID); ok {
+			if m, ok2 := result["message"].(map[string]any); ok2 {
+				m["delay_id"] = id
+			}
+			writeJSON(w, result)
+			return
+		}
+		// Stream message already trimmed
+		writeJSON(w, map[string]any{
+			"found":  true,
+			"source": "delay-delivered",
+			"status": "trimmed",
+			"message": map[string]any{
+				"id":        id,
+				"stream_id": streamID,
+			},
+		})
+		return
+	}
+
 	writeJSON(w, map[string]any{"found": false})
+}
+
+// findInStream searches for a message in the stream and determines its status.
+func (s *Server) findInStream(ctx context.Context, streamKey, topic, id string) (map[string]any, bool) {
+	msgs, err := s.rdb.XRangeN(ctx, streamKey, id, id, 1).Result()
+	if err != nil || len(msgs) == 0 {
+		return nil, false
+	}
+
+	status := s.getMessageStatus(ctx, streamKey, topic, id)
+
+	result := map[string]any{
+		"found":  true,
+		"source": "stream",
+		"status": status,
+		"message": map[string]any{
+			"id":     msgs[0].ID,
+			"values": filterValues(msgs[0].Values),
+		},
+	}
+	return result, true
+}
+
+// getMessageStatus determines if a stream message is consumed, pending, retrying, or dead.
+func (s *Server) getMessageStatus(ctx context.Context, streamKey, topic, msgID string) string {
+	// Check retry counter first
+	retryKey := internal.RetryCountKey(topic, msgID)
+	retryVal, err := s.rdb.Get(ctx, retryKey).Result()
+	if err == nil {
+		if retryVal == "-1" {
+			return "dead"
+		}
+	}
+
+	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
+	if err != nil || len(groups) == 0 {
+		return "unknown"
+	}
+
+	for _, g := range groups {
+		// Check if message is after last-delivered-id (lag)
+		if compareStreamID(msgID, g.LastDeliveredID) > 0 {
+			return "lag"
+		}
+
+		// Check if message is in PEL (pending)
+		pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: streamKey,
+			Group:  g.Name,
+			Start:  msgID,
+			End:    msgID,
+			Count:  1,
+		}).Result()
+		if err == nil && len(pending) > 0 && pending[0].ID == msgID {
+			// If retry count > 0, it's actively retrying
+			if retryVal != "" {
+				count, _ := strconv.Atoi(retryVal)
+				if count > 0 {
+					return "retrying"
+				}
+			}
+			return "pending"
+		}
+	}
+
+	return "consumed"
 }
 
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -656,6 +759,10 @@ func extractTopic(key string) string {
 	if strings.HasPrefix(parts, "dead:") {
 		return strings.TrimPrefix(parts, "dead:")
 	}
+	if strings.HasPrefix(parts, "delay-map:") {
+		// delay-map keys are fxmq:delay-map:{topic}:{delayID}, skip them
+		return ""
+	}
 	if strings.HasPrefix(parts, "delay:data:") {
 		return strings.TrimPrefix(parts, "delay:data:")
 	}
@@ -729,7 +836,7 @@ func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
 	}
 }
 
-// filterValues removes internal fields (e.g. _retry_key) from stream values before returning to frontend.
+// filterValues removes internal fields (prefixed with _) from stream values before returning to frontend.
 func filterValues(values map[string]interface{}) map[string]interface{} {
 	filtered := make(map[string]interface{}, len(values))
 	for k, v := range values {

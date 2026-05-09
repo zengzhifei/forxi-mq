@@ -9,7 +9,6 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/zengzhifei/forxi-mq/deadletter"
 	"github.com/zengzhifei/forxi-mq/internal"
 	"github.com/zengzhifei/forxi-mq/log"
 	"github.com/zengzhifei/forxi-mq/mq"
@@ -27,7 +26,6 @@ type Consumer struct {
 	concurrency int
 	logger      log.Logger
 	retry       *retry.Strategy
-	dlq         *deadletter.Queue
 
 	mu      sync.Mutex
 	cancels []context.CancelFunc
@@ -35,7 +33,7 @@ type Consumer struct {
 }
 
 // New creates a new Consumer.
-func New(rdb *redis.Client, cfg mq.Config, logger log.Logger, rs *retry.Strategy, dlq *deadletter.Queue) *Consumer {
+func New(rdb *redis.Client, cfg mq.Config, logger log.Logger, rs *retry.Strategy) *Consumer {
 	return &Consumer{
 		rdb:         rdb,
 		group:       cfg.Group,
@@ -43,12 +41,12 @@ func New(rdb *redis.Client, cfg mq.Config, logger log.Logger, rs *retry.Strategy
 		concurrency: cfg.Concurrency,
 		logger:      logger,
 		retry:       rs,
-		dlq:         dlq,
 	}
 }
 
 // Subscribe starts consuming messages from the given topic.
-// It spawns cfg.Concurrency workers, each reading from the same consumer group.
+// It spawns cfg.Concurrency workers reading new messages (">") and one dedicated
+// goroutine reading pending messages ("0") that were claimed by Recovery.
 func (c *Consumer) Subscribe(ctx context.Context, topic string, handler Handler) error {
 	stream := internal.StreamKey(topic)
 
@@ -63,17 +61,23 @@ func (c *Consumer) Subscribe(ctx context.Context, topic string, handler Handler)
 	c.cancels = append(c.cancels, cancel)
 	c.mu.Unlock()
 
+	// Workers for new messages
 	for i := 0; i < c.concurrency; i++ {
 		c.wg.Add(1)
 		workerName := fmt.Sprintf("%s-%d", c.consumer, i)
 		go c.worker(subCtx, stream, topic, workerName, handler)
 	}
 
+	// Single goroutine for pending messages (claimed by Recovery via XAUTOCLAIM)
+	c.wg.Add(1)
+	go c.pendingReader(subCtx, stream, topic, c.consumer, handler)
+
 	c.logger.Info("subscribed",
 		"topic", topic, "group", c.group, "concurrency", c.concurrency)
 	return nil
 }
 
+// worker reads only new messages using ">".
 func (c *Consumer) worker(ctx context.Context, stream, topic, name string, handler Handler) {
 	defer c.wg.Done()
 
@@ -111,64 +115,108 @@ func (c *Consumer) worker(ctx context.Context, stream, topic, name string, handl
 	}
 }
 
-func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis.XMessage, handler Handler) {
+// pendingReader reads pending messages (start="0") assigned to this consumer.
+// Recovery claims timed-out messages to this consumer via XAUTOCLAIM, so this
+// goroutine picks them up for reprocessing. It polls periodically.
+func (c *Consumer) pendingReader(ctx context.Context, stream, topic, name string, handler Handler) {
+	defer c.wg.Done()
+
+	const baseInterval = 2 * time.Second
+	const maxInterval = 30 * time.Second
+	interval := baseInterval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		results, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    c.group,
+			Consumer: name,
+			Streams:  []string{stream, "0"},
+			Count:    10,
+		}).Result()
+
+		if err != nil {
+			if err == context.Canceled || ctx.Err() != nil {
+				return
+			}
+			if err != redis.Nil {
+				c.logger.Error("xreadgroup pending error", "stream", stream, "error", err)
+			}
+			time.Sleep(interval)
+			continue
+		}
+
+		hasMessages := false
+		allFailed := true
+		for _, s := range results {
+			for _, xmsg := range s.Messages {
+				hasMessages = true
+				if c.process(ctx, topic, stream, xmsg, handler) {
+					allFailed = false
+				}
+			}
+		}
+
+		if !hasMessages {
+			// No pending messages, reset interval and sleep
+			interval = baseInterval
+			time.Sleep(interval)
+		} else if allFailed {
+			// All messages failed — back off to avoid busy-loop
+			interval = interval * 2
+			if interval > maxInterval {
+				interval = maxInterval
+			}
+			time.Sleep(interval)
+		} else {
+			// Some messages succeeded, reset interval
+			interval = baseInterval
+		}
+	}
+}
+
+func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis.XMessage, handler Handler) bool {
 	body, ok := xmsg.Values["body"].(string)
 	if !ok {
 		c.logger.Error("invalid message body", "stream", stream, "id", xmsg.ID)
 		c.ack(ctx, stream, xmsg.ID)
-		return
+		return true // not a handler failure, just invalid data
 	}
 
 	var msg mq.Message
 	if err := json.Unmarshal([]byte(body), &msg); err != nil {
 		c.logger.Error("unmarshal failed", "stream", stream, "id", xmsg.ID, "error", err)
 		c.ack(ctx, stream, xmsg.ID)
-		return
+		return true
 	}
 	msg.ID = xmsg.ID
 
-	// Use _retry_key if present (message was re-published by recovery)
-	retryKey := xmsg.ID
-	if rk, ok := xmsg.Values["_retry_key"].(string); ok {
-		retryKey = rk
+	// Check if already marked dead (Recovery moved to DLQ but ACK race)
+	if c.retry.IsDead(ctx, topic, xmsg.ID) {
+		c.ack(ctx, stream, xmsg.ID)
+		return true
 	}
 
 	if err := handler(ctx, &msg); err != nil {
-		c.handleFailure(ctx, topic, stream, &msg, retryKey, err)
-		return
+		c.handleFailure(ctx, topic, stream, &msg, err)
+		return false
 	}
 
 	// Success: ACK and clear retry counter
 	c.ack(ctx, stream, xmsg.ID)
-	c.retry.Clear(ctx, topic, retryKey)
+	c.retry.Clear(ctx, topic, xmsg.ID)
+	return true
 }
 
-func (c *Consumer) handleFailure(ctx context.Context, topic, stream string, msg *mq.Message, retryKey string, handlerErr error) {
-	count, err := c.retry.GetCount(ctx, topic, retryKey)
-	if err != nil {
-		c.logger.Error("get retry count failed", "topic", topic, "msg_id", msg.ID, "error", err)
-		// Don't ACK — leave it pending for recovery
-		return
-	}
-
-	// Consumer does NOT increment — only recovery increments to avoid double-counting.
-	// But if count already reached max (set by recovery), push to DLQ immediately.
-	if count >= c.retry.MaxRetry() {
-		reason := fmt.Sprintf("max retries reached (%d): %v", count, handlerErr)
-		if err := c.dlq.Push(ctx, msg, reason); err != nil {
-			c.logger.Error("dlq push failed, leaving pending", "topic", topic, "msg_id", msg.ID, "error", err)
-			return
-		}
-		c.ack(ctx, stream, msg.ID)
-		c.retry.Clear(ctx, topic, retryKey)
-		return
-	}
-
-	// Log warning, don't ACK — leave it pending for XAUTOCLAIM recovery
-	c.logger.Warn("message processing failed, will retry",
-		"topic", topic, "msg_id", msg.ID,
-		"attempt", count,
-		"error", handlerErr)
+func (c *Consumer) handleFailure(ctx context.Context, topic, stream string, msg *mq.Message, handlerErr error) {
+	// Don't ACK — leave in PEL for Recovery to handle via XAUTOCLAIM.
+	// Recovery will increment retry counter and eventually move to DLQ.
+	c.logger.Warn("message processing failed, leaving for recovery",
+		"topic", topic, "msg_id", msg.ID, "error", handlerErr)
 }
 
 func (c *Consumer) ack(ctx context.Context, stream, id string) {

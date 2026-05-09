@@ -16,33 +16,31 @@ import (
 
 // Recovery periodically claims pending messages that exceeded ACK timeout.
 type Recovery struct {
-	rdb          *redis.Client
-	group        string
-	consumer     string
-	topics       []string
-	maxRetry     int
-	streamMaxLen int64
-	ackTimeout   time.Duration
-	interval     time.Duration
-	logger       log.Logger
-	retry        *retry.Strategy
-	dlq          *deadletter.Queue
+	rdb        *redis.Client
+	group      string
+	consumer   string
+	topics     []string
+	maxRetry   int
+	ackTimeout time.Duration
+	interval   time.Duration
+	logger     log.Logger
+	retry      *retry.Strategy
+	dlq        *deadletter.Queue
 }
 
 // New creates a new Recovery process.
 func New(rdb *redis.Client, cfg mq.Config, topics []string, logger log.Logger, rs *retry.Strategy, dlq *deadletter.Queue) *Recovery {
 	return &Recovery{
-		rdb:          rdb,
-		group:        cfg.Group,
-		consumer:     cfg.Consumer,
-		topics:       topics,
-		maxRetry:     cfg.MaxRetry,
-		streamMaxLen: cfg.StreamMaxLen,
-		ackTimeout:   cfg.AckTimeout,
-		interval:     cfg.RecoveryInterval,
-		logger:       logger,
-		retry:        rs,
-		dlq:          dlq,
+		rdb:        rdb,
+		group:      cfg.Group,
+		consumer:   cfg.Consumer,
+		topics:     topics,
+		maxRetry:   cfg.MaxRetry,
+		ackTimeout: cfg.AckTimeout,
+		interval:   cfg.RecoveryInterval,
+		logger:     logger,
+		retry:      rs,
+		dlq:        dlq,
 	}
 }
 
@@ -66,6 +64,7 @@ func (r *Recovery) Run(ctx context.Context) {
 func (r *Recovery) recover(ctx context.Context, topic string) {
 	stream := internal.StreamKey(topic)
 
+	// Claim timed-out messages — message stays in PEL with same ID, just ownership transfers.
 	msgs, _, err := r.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream:   stream,
 		Group:    r.group,
@@ -95,20 +94,20 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 		}
 		msg.ID = xmsg.ID
 
-		// Use _retry_key if present (carried from previous re-publish)
-		retryKey := xmsg.ID
-		if rk, ok := xmsg.Values["_retry_key"].(string); ok {
-			retryKey = rk
+		// Skip if already marked dead (avoid re-pushing to DLQ)
+		if r.retry.IsDead(ctx, topic, xmsg.ID) {
+			r.ack(ctx, stream, xmsg.ID)
+			continue
 		}
 
-		count, err := r.retry.GetCount(ctx, topic, retryKey)
+		count, err := r.retry.GetCount(ctx, topic, xmsg.ID)
 		if err != nil {
 			r.logger.Error("get retry count failed", "topic", topic, "msg_id", xmsg.ID, "error", err)
 			continue
 		}
 
 		// Increment retry count
-		r.retry.Increment(ctx, topic, retryKey)
+		r.retry.Increment(ctx, topic, xmsg.ID)
 		count++
 
 		if count >= r.maxRetry {
@@ -117,29 +116,12 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 				r.logger.Error("dlq push failed", "topic", topic, "msg_id", xmsg.ID, "error", err)
 				continue
 			}
+			r.retry.MarkDead(ctx, topic, xmsg.ID)
 			r.ack(ctx, stream, xmsg.ID)
-			r.retry.Clear(ctx, topic, retryKey)
 			r.logger.Info("message moved to DLQ", "topic", topic, "msg_id", xmsg.ID, "retries", count)
 		} else {
-			// Re-publish to stream for workers to pick up, then ACK the old one
-			args := &redis.XAddArgs{
-				Stream: stream,
-				Values: map[string]interface{}{
-					"body":       body,
-					"_retry_key": retryKey,
-				},
-			}
-			if r.streamMaxLen > 0 {
-				args.MaxLen = r.streamMaxLen
-				args.Approx = true
-			}
-			err := r.rdb.XAdd(ctx, args).Err()
-			if err != nil {
-				r.logger.Error("re-publish failed", "topic", topic, "msg_id", xmsg.ID, "error", err)
-				continue
-			}
-			r.ack(ctx, stream, xmsg.ID)
-			r.logger.Info("message re-queued for retry", "topic", topic, "msg_id", xmsg.ID, "attempt", count)
+			// Leave in PEL — worker will pick it up via pending read
+			r.logger.Info("message claimed for retry", "topic", topic, "msg_id", xmsg.ID, "attempt", count)
 		}
 	}
 
@@ -149,5 +131,7 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 }
 
 func (r *Recovery) ack(ctx context.Context, stream, id string) {
-	r.rdb.XAck(ctx, stream, r.group, id)
+	if err := r.rdb.XAck(ctx, stream, r.group, id).Err(); err != nil {
+		r.logger.Error("ack failed", "stream", stream, "id", id, "error", err)
+	}
 }

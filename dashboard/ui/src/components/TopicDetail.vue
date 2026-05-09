@@ -232,11 +232,27 @@ async function publishMessage() {
       publishBody.value = ''
       publishDueAt.value = null
       fetchAll()
+      const msgId = data.id
       ElMessageBox.alert(
-        `<div style="word-break:break-all;font-family:monospace;font-size:13px;padding:8px;background:var(--el-bg-color-page);border-radius:4px;cursor:pointer;" onclick="navigator.clipboard.writeText('${data.id}')">${data.id}</div><div style="margin-top:8px;font-size:12px;color:var(--el-text-color-secondary);">点击 ID 可复制</div>`,
+        `<div id="pub-id-box" style="word-break:break-all;font-family:monospace;font-size:13px;padding:8px;background:var(--el-bg-color-page);border-radius:4px;cursor:pointer;">${msgId}</div><div style="margin-top:8px;font-size:12px;color:var(--el-text-color-secondary);">点击 ID 可复制</div>`,
         `${typeLabel}发布成功`,
-        { dangerouslyUseHTMLString: true, confirmButtonText: '确定' }
-      )
+        {
+          dangerouslyUseHTMLString: true,
+          confirmButtonText: '确定',
+          callback: () => {}
+        }
+      ).then(() => {})
+      // Attach click handler after DOM update
+      setTimeout(() => {
+        const el = document.getElementById('pub-id-box')
+        if (el) {
+          el.addEventListener('click', () => {
+            navigator.clipboard.writeText(msgId).then(() => {
+              ElMessage.success('已复制 ID')
+            })
+          })
+        }
+      }, 100)
     } else {
       ElMessage.error(data.error || '发布失败')
     }
@@ -430,6 +446,34 @@ function handleClose() {
   emit('close')
 }
 
+function statusTagType(status) {
+  const map = {
+    consumed: 'success',
+    pending: 'warning',
+    retrying: 'danger',
+    lag: 'danger',
+    dead: 'danger',
+    waiting: 'warning',
+    trimmed: 'info',
+    unknown: 'info',
+  }
+  return map[status] || 'info'
+}
+
+function statusLabel(status) {
+  const map = {
+    consumed: '已消费',
+    pending: '处理中',
+    retrying: '重试中',
+    lag: '积压',
+    dead: '死信',
+    waiting: '等待投递',
+    trimmed: '已裁剪',
+    unknown: '未知',
+  }
+  return map[status] || status
+}
+
 watch(() => props.topic, () => { fetchAll() }, { immediate: true })
 timer = setInterval(fetchDetail, 3000)
 onUnmounted(() => clearInterval(timer))
@@ -492,12 +536,21 @@ onUnmounted(() => clearInterval(timer))
     <div v-if="searchResult" class="search-result">
       <div v-if="searchResult.found" class="search-found">
         <div class="search-found-header">
-          <el-tag size="small" :type="searchResult.source === 'dead' ? 'danger' : 'info'">
-            {{ searchResult.source === 'dead' ? '死信' : '主队列' }}
+          <el-tag size="small" :type="statusTagType(searchResult.status)">
+            {{ statusLabel(searchResult.status) }}
           </el-tag>
           <span class="id-copy" @click="copyText(searchResult.message.id)">{{ searchResult.message.id }}</span>
+          <span v-if="searchResult.message.stream_id" class="id-copy" style="margin-left:4px;" @click="copyText(searchResult.message.stream_id)">
+            → {{ searchResult.message.stream_id }}
+          </span>
           <el-button :icon="CopyDocument" size="small" circle class="copy-btn" title="复制消息体" @click="copyText(formatSearchBody(searchResult.message))" />
           <el-button :icon="RefreshRight" size="small" circle class="copy-btn" title="重新投递" @click="resendMsg(searchResult.message)" />
+        </div>
+        <div v-if="searchResult.message.due_at" style="font-size:12px;color:var(--el-text-color-secondary);margin-bottom:6px;">
+          投递时间: {{ searchResult.message.due_at }}
+        </div>
+        <div v-if="searchResult.message.delay_id" style="font-size:12px;color:var(--el-text-color-secondary);margin-bottom:6px;">
+          延迟消息 ID: {{ searchResult.message.delay_id }}
         </div>
         <pre class="msg-expand">{{ formatSearchBody(searchResult.message) }}</pre>
       </div>

@@ -45,11 +45,6 @@ func WithMaxRetry(n int) Option {
 	return func(e *Engine) { e.cfg.MaxRetry = n }
 }
 
-// WithRetryBackoff sets the base backoff duration (default: 2s).
-func WithRetryBackoff(d time.Duration) Option {
-	return func(e *Engine) { e.cfg.RetryBackoff = d }
-}
-
 // WithAckTimeout sets the pending message timeout (default: 60s).
 func WithAckTimeout(d time.Duration) Option {
 	return func(e *Engine) { e.cfg.AckTimeout = d }
@@ -166,10 +161,14 @@ func NewEngine(redisAddr, group string, opts ...Option) (*Engine, error) {
 		e.logger = log.New()
 	}
 
-	rs := retry.New(e.rdb, e.cfg.MaxRetry, e.cfg.RetryBackoff)
+	retryTTL := e.cfg.Retention
+	if retryTTL <= 0 {
+		retryTTL = 7 * 24 * time.Hour // default 7 days
+	}
+	rs := retry.New(e.rdb, retryTTL)
 	dlq := deadletter.New(e.rdb, e.logger)
 	p := producer.New(e.rdb, e.cfg.StreamMaxLen)
-	c := consumer.New(e.rdb, e.cfg, e.logger, rs, dlq)
+	c := consumer.New(e.rdb, e.cfg, e.logger, rs)
 
 	e.Producer = p
 	e.Consumer = c
@@ -201,7 +200,11 @@ func (e *Engine) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
 
-	e.delayPoller = delay.New(e.rdb, e.topics, e.cfg.DelayPollInterval, e.cfg.StreamMaxLen, e.logger)
+	mapTTL := e.cfg.Retention
+	if mapTTL <= 0 {
+		mapTTL = 7 * 24 * time.Hour // default 7 days
+	}
+	e.delayPoller = delay.New(e.rdb, e.topics, e.cfg.DelayPollInterval, e.cfg.StreamMaxLen, mapTTL, e.logger)
 	e.bgWg.Add(1)
 	go func() {
 		defer e.bgWg.Done()

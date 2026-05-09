@@ -22,7 +22,6 @@ func main() {
 	// engine, err := fxmq.NewEngine("localhost:6379", "order-service",
 	//     fxmq.WithConcurrency(8),
 	//     fxmq.WithMaxRetry(5),
-	//     fxmq.WithRetryBackoff(2*time.Second),
 	//     fxmq.WithAckTimeout(60*time.Second),
 	//     fxmq.WithRedisPassword("secret"),
 	// )

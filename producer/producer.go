@@ -67,7 +67,11 @@ func (p *Producer) DelayPublish(ctx context.Context, msg *mq.Message, delay time
 	pipe.ZAdd(ctx, delayKey, redis.Z{Score: score, Member: id})
 	pipe.HSet(ctx, dataKey, id, string(body))
 	_, err = pipe.Exec(ctx)
-	return err
+	if err != nil {
+		return err
+	}
+	msg.ID = id
+	return nil
 }
 
 func generateID() string {
