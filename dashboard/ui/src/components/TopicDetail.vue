@@ -618,11 +618,16 @@ onUnmounted(() => clearInterval(timer))
               <el-tag v-if="group.name === selfGroup" type="primary" size="small" effect="dark">当前</el-tag>
               <el-tag v-if="group.lag > 0" type="danger" size="small" effect="dark">lag: {{ group.lag }}</el-tag>
               <el-tag v-if="group.pending > 0" type="warning" size="small">pending: {{ group.pending }}</el-tag>
-              <el-tag v-if="group.lag === 0 && group.pending === 0" type="success" size="small">healthy</el-tag>
+              <el-tag v-if="(!group.consumers || group.consumers.length === 0)" type="info" size="small">inactive</el-tag>
+              <el-tag v-else-if="group.lag === 0 && group.pending === 0" type="success" size="small">healthy</el-tag>
               <template v-if="group.name === selfGroup">
                 <el-button size="small" :icon="Position" @click="resetGroup(group, 'start')" title="重置到起始点（从头消费）">重置到起始</el-button>
                 <el-button size="small" @click="resetGroup(group, 'latest')" title="重置到最新点（跳过历史）">重置到最新</el-button>
               </template>
+            </div>
+            <div class="group-meta">
+              <span class="meta-label">消费位点:</span>
+              <span class="meta-value id-copy" @click="copyText(group.last_delivered || '')">{{ group.last_delivered || '-' }}</span>
             </div>
             <el-table :data="group.consumers || []" size="small" stripe>
               <el-table-column prop="name" label="Consumer" />
@@ -930,7 +935,24 @@ onUnmounted(() => clearInterval(timer))
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-bottom: 4px;
+}
+
+.group-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.meta-label {
+  color: var(--el-text-color-secondary, #a3a6ad);
+}
+
+.meta-value {
+  font-family: monospace;
+  color: var(--el-text-color-regular, #cfd3dc);
 }
 
 .tab-actions {

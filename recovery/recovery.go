@@ -56,6 +56,8 @@ func (r *Recovery) Run(ctx context.Context) {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
+	var tick int
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -63,6 +65,14 @@ func (r *Recovery) Run(ctx context.Context) {
 		case <-ticker.C:
 			for _, topic := range r.topics {
 				r.recover(ctx, topic)
+			}
+			// Clean stale consumers every ~5 minutes (based on tick count)
+			tick++
+			cleanEvery := int(5*time.Minute/r.interval) + 1
+			if tick%cleanEvery == 0 {
+				for _, topic := range r.topics {
+					r.cleanStaleConsumers(ctx, topic)
+				}
 			}
 		}
 	}
@@ -139,5 +149,33 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 func (r *Recovery) ack(ctx context.Context, stream, id string) {
 	if err := r.rdb.XAck(ctx, stream, r.group, id).Err(); err != nil {
 		r.logger.Error("ack failed", "stream", stream, "id", id, "error", err)
+	}
+}
+
+// cleanStaleConsumers removes consumers that have no pending messages and have been idle too long.
+func (r *Recovery) cleanStaleConsumers(ctx context.Context, topic string) {
+	stream := internal.StreamKey(topic)
+	consumers, err := r.rdb.XInfoConsumers(ctx, stream, r.group).Result()
+	if err != nil {
+		return
+	}
+
+	// Threshold: 2x ackTimeout, minimum 5 minutes
+	threshold := r.ackTimeout * 2
+	if threshold < 5*time.Minute {
+		threshold = 5 * time.Minute
+	}
+
+	for _, c := range consumers {
+		if c.Name == r.consumer {
+			continue
+		}
+		if c.Pending == 0 && c.Idle >= threshold {
+			if err := r.rdb.XGroupDelConsumer(ctx, stream, r.group, c.Name).Err(); err != nil {
+				r.logger.Error("del stale consumer failed", "stream", stream, "consumer", c.Name, "error", err)
+			} else {
+				r.logger.Info("removed stale consumer", "stream", stream, "consumer", c.Name, "idle", c.Idle)
+			}
+		}
 	}
 }

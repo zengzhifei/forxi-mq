@@ -37,10 +37,11 @@ type topicInfo struct {
 }
 
 type groupInfo struct {
-	Name      string         `json:"name"`
-	Pending   int64          `json:"pending"`
-	Lag       int64          `json:"lag"`
-	Consumers []consumerInfo `json:"consumers,omitempty"`
+	Name           string         `json:"name"`
+	Pending        int64          `json:"pending"`
+	Lag            int64          `json:"lag"`
+	LastDelivered  string         `json:"last_delivered"`
+	Consumers      []consumerInfo `json:"consumers,omitempty"`
 }
 
 type consumerInfo struct {
@@ -109,9 +110,10 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		for _, g := range groups {
 			gi := groupInfo{
-				Name:    g.Name,
-				Pending: g.Pending,
-				Lag:     g.Lag,
+				Name:          g.Name,
+				Pending:       g.Pending,
+				Lag:           g.Lag,
+				LastDelivered: g.LastDeliveredID,
 			}
 			consumers, err := s.rdb.XInfoConsumers(ctx, internal.StreamKey(topic), g.Name).Result()
 			if err == nil {
