@@ -9,9 +9,9 @@ func StreamKey(topic string) string {
 	return fmt.Sprintf("%s:%s", prefix, topic)
 }
 
-// DeadLetterKey returns the dead letter stream key for a topic.
-func DeadLetterKey(topic string) string {
-	return fmt.Sprintf("%s:dead:%s", prefix, topic)
+// DeadLetterKey returns the dead letter stream key for a topic and group.
+func DeadLetterKey(topic, group string) string {
+	return fmt.Sprintf("%s:dead:%s:%s", prefix, topic, group)
 }
 
 // DelayKey returns the sorted set key for delay messages (stores ID → score).
@@ -24,12 +24,12 @@ func DelayDataKey(topic string) string {
 	return fmt.Sprintf("%s:delay:data:%s", prefix, topic)
 }
 
-// RetryCountKey returns the retry counter key for a specific message.
-func RetryCountKey(topic, msgID string) string {
-	return fmt.Sprintf("%s:retry:%s:%s", prefix, topic, msgID)
-}
-
 // DelayMapKey returns the key that maps a delay ID to its stream ID after delivery.
 func DelayMapKey(topic, delayID string) string {
 	return fmt.Sprintf("%s:delay-map:%s:%s", prefix, topic, delayID)
+}
+
+// RetryCountKey returns the retry counter key for a specific message in a group.
+func RetryCountKey(topic, group, msgID string) string {
+	return fmt.Sprintf("%s:retry:%s:%s:%s", prefix, topic, group, msgID)
 }

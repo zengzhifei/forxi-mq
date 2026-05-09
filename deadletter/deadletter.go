@@ -14,12 +14,13 @@ import (
 // Queue manages dead letter operations.
 type Queue struct {
 	rdb    *redis.Client
+	group  string
 	logger log.Logger
 }
 
 // New creates a new dead letter Queue.
-func New(rdb *redis.Client, logger log.Logger) *Queue {
-	return &Queue{rdb: rdb, logger: logger}
+func New(rdb *redis.Client, group string, logger log.Logger) *Queue {
+	return &Queue{rdb: rdb, group: group, logger: logger}
 }
 
 // Push moves a message to the dead letter stream.
@@ -30,7 +31,7 @@ func (q *Queue) Push(ctx context.Context, msg *mq.Message, reason string) error 
 	}
 
 	err = q.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: internal.DeadLetterKey(msg.Topic),
+		Stream: internal.DeadLetterKey(msg.Topic, q.group),
 		Values: map[string]interface{}{
 			"body":   string(body),
 			"reason": reason,
@@ -50,5 +51,5 @@ func (q *Queue) Push(ctx context.Context, msg *mq.Message, reason string) error 
 
 // List reads messages from the dead letter queue for inspection.
 func (q *Queue) List(ctx context.Context, topic string, count int64) ([]redis.XMessage, error) {
-	return q.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), "-", "+", count).Result()
+	return q.rdb.XRangeN(ctx, internal.DeadLetterKey(topic, q.group), "-", "+", count).Result()
 }

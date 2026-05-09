@@ -19,7 +19,7 @@ func cleanupKeys(rdb *redis.Client, topic string) {
 	ctx := context.Background()
 	rdb.Del(ctx,
 		internal.StreamKey(topic),
-		internal.DeadLetterKey(topic),
+		internal.DeadLetterKey(topic, "test-group"),
 		internal.DelayKey(topic),
 		internal.DelayDataKey(topic),
 	)
@@ -109,8 +109,7 @@ func TestRetryAndDLQ(t *testing.T) {
 
 	e := newTestEngine(t,
 		fxmq.WithMaxRetry(3),
-		fxmq.WithAckTimeout(1*time.Second),
-		fxmq.WithRecoveryInterval(2*time.Second),
+		fxmq.WithAckTimeout(2*time.Second),
 		fxmq.WithConcurrency(1),
 	)
 	defer e.Shutdown()
@@ -143,7 +142,7 @@ func TestRetryAndDLQ(t *testing.T) {
 		default:
 		}
 
-		dlqLen, _ := rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
+		dlqLen, _ := rdb.XLen(ctx, internal.DeadLetterKey(topic, "test-group")).Result()
 		if dlqLen > 0 {
 			t.Logf("message reached DLQ after %d handler attempts", attempts.Load())
 			break
@@ -152,7 +151,7 @@ func TestRetryAndDLQ(t *testing.T) {
 	}
 
 	// Verify DLQ entry
-	dlqMsgs, _ := rdb.XRange(ctx, internal.DeadLetterKey(topic), "-", "+").Result()
+	dlqMsgs, _ := rdb.XRange(ctx, internal.DeadLetterKey(topic, "test-group"), "-", "+").Result()
 	if len(dlqMsgs) != 1 {
 		t.Fatalf("expected 1 DLQ message, got %d", len(dlqMsgs))
 	}
@@ -314,8 +313,7 @@ func TestMessageIDPreservedThroughRetry(t *testing.T) {
 
 	e := newTestEngine(t,
 		fxmq.WithMaxRetry(2),
-		fxmq.WithAckTimeout(1*time.Second),
-		fxmq.WithRecoveryInterval(1*time.Second),
+		fxmq.WithAckTimeout(2*time.Second),
 		fxmq.WithConcurrency(1),
 	)
 	defer e.Shutdown()
@@ -349,7 +347,7 @@ func TestMessageIDPreservedThroughRetry(t *testing.T) {
 			t.Fatal("timeout waiting for DLQ")
 		default:
 		}
-		dlqLen, _ := rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
+		dlqLen, _ := rdb.XLen(ctx, internal.DeadLetterKey(topic, "test-group")).Result()
 		if dlqLen > 0 {
 			break
 		}
@@ -411,13 +409,12 @@ func TestIsDeadSkipsHandler(t *testing.T) {
 	})
 
 	// Mark as dead BEFORE starting the engine
-	retryKey := fmt.Sprintf("fxmq:retry:%s:%s", topic, msgID)
+	retryKey := fmt.Sprintf("fxmq:retry:%s:%s:%s", topic, "test-group", msgID)
 	rdb.Set(ctx, retryKey, "-1", 10*time.Minute)
 
-	// Now start engine — the pendingReader should see this pending message but skip it
+	// Now start engine — the retryWorker should see this pending message but skip it
 	e, err := fxmq.NewEngine("localhost:6379", "test-group",
-		fxmq.WithAckTimeout(1*time.Second),
-		fxmq.WithRecoveryInterval(1*time.Second),
+		fxmq.WithAckTimeout(2*time.Second),
 		fxmq.WithConcurrency(1),
 	)
 	if err != nil {
@@ -446,7 +443,7 @@ func TestIsDeadSkipsHandler(t *testing.T) {
 		t.Fatalf("expected 0 handler calls for dead message, got %d", handlerCalls.Load())
 	}
 
-	// Verify the message was ACKed (no longer in PEL)
+	// Verify the message is still in PEL (dead messages are NOT acked, kept for requeue)
 	pending, _ := rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: stream,
 		Group:  "test-group",
@@ -455,10 +452,15 @@ func TestIsDeadSkipsHandler(t *testing.T) {
 		Count:  10,
 	}).Result()
 
+	found := false
 	for _, p := range pending {
 		if p.ID == msgID {
-			t.Fatalf("dead message %s should have been ACKed, but still in PEL", msgID)
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Fatalf("dead message %s should remain in PEL for requeue, but was ACKed", msgID)
 	}
 }
 

@@ -173,9 +173,8 @@ func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis
 	}
 	msg.ID = xmsg.ID
 
-	// Check if already marked dead (Recovery moved to DLQ but ACK race)
+	// Check if already marked dead — skip without ACK (leave in PEL for requeue)
 	if c.retry.IsDead(ctx, topic, xmsg.ID) {
-		c.ack(ctx, stream, xmsg.ID)
 		return
 	}
 

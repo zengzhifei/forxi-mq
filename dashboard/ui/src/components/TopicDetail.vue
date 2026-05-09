@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch, onUnmounted } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import { Refresh, Search, CopyDocument, RefreshRight, ArrowLeft, ArrowRight, Delete, Download, Plus, Position } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -8,6 +8,7 @@ const emit = defineEmits(['close'])
 
 const visible = ref(true)
 const detail = ref(null)
+const selfGroup = ref('')
 const messages = ref([])
 const lagMessages = ref([])
 const pendingMessages = ref([])
@@ -15,6 +16,7 @@ const deadMessages = ref([])
 const delayMessages = ref([])
 const activeTab = ref('overview')
 const requeueLoading = ref(false)
+const deleteTopicLoading = ref(false)
 const searchId = ref('')
 const searchResult = ref(null)
 const searchLoading = ref(false)
@@ -45,7 +47,24 @@ const nextCursors = ref({
 const delayOffset = ref(0)
 const delayHasMore = ref(false)
 
+const sortedGroups = computed(() => {
+  if (!detail.value?.groups) return []
+  return [...detail.value.groups].sort((a, b) => {
+    if (a.name === selfGroup.value) return -1
+    if (b.name === selfGroup.value) return 1
+    return 0
+  })
+})
+
 // --- Fetch ---
+
+async function fetchConfig() {
+  try {
+    const res = await fetch('/api/config')
+    const data = await res.json()
+    selfGroup.value = data.group || ''
+  } catch (e) { console.error(e) }
+}
 
 async function fetchDetail() {
   try {
@@ -309,19 +328,19 @@ async function deleteDelay(row) {
 
 // --- Reset Group ---
 
-async function resetGroup(group) {
+async function resetGroup(group, mode) {
+  const isLatest = mode === 'latest'
+  const desc = isLatest
+    ? `重置消费组 "${group.name}" 的消费位点到最新？\n将跳过所有历史消息，只消费之后产生的新消息。`
+    : `重置消费组 "${group.name}" 的消费位点到起始点？\n将从头开始重新消费所有消息。`
   try {
-    await ElMessageBox.confirm(
-      `重置消费组 "${group.name}" 的消费位点？\n将从头开始重新消费所有消息。`,
-      '重置确认',
-      { type: 'warning' }
-    )
+    await ElMessageBox.confirm(desc, '重置确认', { type: 'warning' })
   } catch { return }
   try {
     const res = await fetch(`/api/topics/${props.topic}/groups/${group.name}/reset`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: '0' })
+      body: JSON.stringify({ id: isLatest ? '$' : '0' })
     })
     const data = await res.json()
     if (data.ok) {
@@ -362,6 +381,31 @@ function exportMessages(tab) {
 }
 
 // --- Actions ---
+
+async function deleteTopic() {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除 Topic "${props.topic}"？\n仅当 Stream、死信、延迟队列均为空时可删除。`,
+      '删除 Topic',
+      { type: 'warning' }
+    )
+  } catch { return }
+  deleteTopicLoading.value = true
+  try {
+    const res = await fetch(`/api/topics/${props.topic}`, { method: 'DELETE' })
+    const data = await res.json()
+    if (data.ok) {
+      ElMessage.success('Topic 已删除')
+      handleClose()
+    } else {
+      ElMessage.error(data.error || '删除失败')
+    }
+  } catch (e) {
+    ElMessage.error('删除失败')
+  } finally {
+    deleteTopicLoading.value = false
+  }
+}
 
 async function requeue() {
   requeueLoading.value = true
@@ -474,6 +518,7 @@ function statusLabel(status) {
   return map[status] || status
 }
 
+fetchConfig()
 watch(() => props.topic, () => { fetchAll() }, { immediate: true })
 timer = setInterval(fetchDetail, 3000)
 onUnmounted(() => clearInterval(timer))
@@ -520,7 +565,7 @@ onUnmounted(() => clearInterval(timer))
       <el-input
         v-model="searchId"
         :prefix-icon="Search"
-        placeholder="精确搜索 Message ID..."
+        placeholder="精确搜索 Message ID / Delay ID..."
         size="small"
         clearable
         style="width: 280px;"
@@ -530,6 +575,7 @@ onUnmounted(() => clearInterval(timer))
       <el-button size="small" :loading="searchLoading" @click="searchById" title="从Redis精确查找">搜索</el-button>
       <el-button :icon="Refresh" size="small" @click="fetchAll" title="刷新数据">Refresh</el-button>
       <el-button :icon="Plus" size="small" type="primary" @click="publishVisible = true" title="发布消息到该Topic">发布</el-button>
+      <el-button :icon="Delete" size="small" type="danger" :loading="deleteTopicLoading" :disabled="(detail?.stored || 0) > 0 || (detail?.dead || 0) > 0 || (detail?.delay || 0) > 0" @click="deleteTopic" title="删除空 Topic（需Stream/死信/延迟均为空）">删除 Topic</el-button>
     </div>
 
     <!-- Search Result -->
@@ -563,16 +609,20 @@ onUnmounted(() => clearInterval(timer))
       <!-- Overview / Groups -->
       <el-tab-pane name="overview">
         <template #label>
-          <span title="消费者组">Groups <el-badge v-if="detail?.groups?.length" :value="detail.groups.length" /></span>
+          <span title="消费者组">Groups</span>
         </template>
         <div v-if="detail?.groups?.length" class="groups-list">
-          <div v-for="group in detail.groups" :key="group.name" class="group-card">
+          <div v-for="group in sortedGroups" :key="group.name" class="group-card">
             <div class="group-header">
               <strong>{{ group.name }}</strong>
+              <el-tag v-if="group.name === selfGroup" type="primary" size="small" effect="dark">当前</el-tag>
               <el-tag v-if="group.lag > 0" type="danger" size="small" effect="dark">lag: {{ group.lag }}</el-tag>
               <el-tag v-if="group.pending > 0" type="warning" size="small">pending: {{ group.pending }}</el-tag>
               <el-tag v-if="group.lag === 0 && group.pending === 0" type="success" size="small">healthy</el-tag>
-              <el-button size="small" :icon="Position" @click="resetGroup(group)" title="重置消费位点（从头消费）">重置位点</el-button>
+              <template v-if="group.name === selfGroup">
+                <el-button size="small" :icon="Position" @click="resetGroup(group, 'start')" title="重置到起始点（从头消费）">重置到起始</el-button>
+                <el-button size="small" @click="resetGroup(group, 'latest')" title="重置到最新点（跳过历史）">重置到最新</el-button>
+              </template>
             </div>
             <el-table :data="group.consumers || []" size="small" stripe>
               <el-table-column prop="name" label="Consumer" />
@@ -587,7 +637,7 @@ onUnmounted(() => clearInterval(timer))
       <!-- All Messages -->
       <el-tab-pane name="messages">
         <template #label>
-          <span title="全部消息">Messages</span>
+          <span title="当前 Group 已投递的消息">Messages (Group)</span>
         </template>
         <div class="tab-actions">
           <el-button :icon="Download" size="small" @click="exportMessages('messages')" title="导出当前页为JSON">导出</el-button>
@@ -625,7 +675,7 @@ onUnmounted(() => clearInterval(timer))
       <!-- Lag -->
       <el-tab-pane name="lag">
         <template #label>
-          <span title="积压未消费">Lag</span>
+          <span title="当前 Group 未投递的积压消息">Lag (Group)</span>
         </template>
         <div class="tab-actions">
           <el-button :icon="Download" size="small" @click="exportMessages('lag')" title="导出当前页为JSON">导出</el-button>
@@ -664,7 +714,7 @@ onUnmounted(() => clearInterval(timer))
       <!-- Pending -->
       <el-tab-pane name="pending">
         <template #label>
-          <span title="处理中未确认">Pending</span>
+          <span title="当前 Group 已投递未确认的消息">Pending (Group)</span>
         </template>
         <div class="tab-actions">
           <el-button :icon="Download" size="small" @click="exportMessages('pending')" title="导出当前页为JSON">导出</el-button>
@@ -680,8 +730,7 @@ onUnmounted(() => clearInterval(timer))
               <span class="id-copy" @click.stop="copyText(row.id)">{{ row.id }}</span>
             </template>
           </el-table-column>
-          <el-table-column prop="group" label="Group" width="100" />
-          <el-table-column prop="consumer" label="Consumer" width="100" />
+          <el-table-column prop="consumer" label="Consumer" width="120" />
           <el-table-column prop="idle" label="Idle" width="80" />
           <el-table-column prop="retry_count" label="Retry" width="55" align="center" />
           <el-table-column label="Body">
@@ -758,6 +807,11 @@ onUnmounted(() => clearInterval(timer))
           <el-table-column type="expand">
             <template #default="{ row }">
               <pre class="msg-expand">{{ row.body }}</pre>
+            </template>
+          </el-table-column>
+          <el-table-column label="Delay ID" width="220">
+            <template #default="{ row }">
+              <span class="id-copy" @click.stop="copyText(row.id)">{{ row.id }}</span>
             </template>
           </el-table-column>
           <el-table-column prop="due_at" label="Due At" width="200" />

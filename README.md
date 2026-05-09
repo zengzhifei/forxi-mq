@@ -16,7 +16,7 @@
 
 - **轻量** — 不依赖额外 Broker，Redis 即消息服务端
 - **开箱即用** — 两行代码接入，所有配置都有合理默认值
-- **功能完整** — 延迟队列、重试、死信队列、优雅退出、Webhook 告警
+- **功能完整** — 延迟队列、重试、死信队列（自动过期清理）、优雅退出、Webhook 告警
 - **可观测** — 内置 Web Dashboard，实时监控队列状态
 - **生产可靠** — Consumer Group 保证消息不丢，XAUTOCLAIM 自动恢复超时消息
 
@@ -137,11 +137,12 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
 
 - 所有 Topic 概览（消息量、Lag、Pending、Dead Letter、Delay）
 - Consumer Group 列表及状态
-- 消息列表分页浏览 + 精确搜索
+- 消息列表分页浏览 + 精确搜索（支持 Message ID / Delay ID）
 - 死信消息查看、重新投递、单条删除
 - 延迟队列查看与删除
-- 手动发布消息到任意 Topic
-- 消费组位点重置
+- 手动发布消息到任意 Topic（支持即时 / 定时投递）
+- 消费组位点重置（重置到起始 / 重置到最新）
+- 空 Topic 手动删除（Stream、DLQ、Delay 均为空时可删除）
 - 当前页导出 JSON
 - 亮色/暗色主题切换
 
@@ -184,8 +185,8 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
     fxmq.WithConcurrency(16),                   // 并发 worker 数（默认 8）
     fxmq.WithMaxRetry(5),                       // 最大重试次数（默认 3）
     fxmq.WithAckTimeout(60*time.Second),        // 消息超时（默认 60s）
-    fxmq.WithRecoveryInterval(15*time.Second),  // 恢复检查间隔（默认 15s）
     fxmq.WithRetention(7*24*time.Hour),         // 消息保留时间（默认不限）
+    fxmq.WithDLQRetention(3*24*time.Hour),      // 死信保留时间（默认 7 天）
     fxmq.WithStreamMaxLen(50000),               // Stream 最大条数（默认不限）
     fxmq.WithDashboard(":9090"),                // 开启 Dashboard
     fxmq.WithAlert(fxmq.AlertConfig{...}),      // 开启 Webhook 告警
@@ -203,8 +204,9 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
 | Concurrency | 8 | 每个 Topic 的消费 worker 数 |
 | MaxRetry | 3 | 超过后进入死信队列 |
 | AckTimeout | 60s | 超时未 ACK 触发恢复重试 |
-| RecoveryInterval | 15s | 超时消息恢复检查间隔 |
-| Retention | 0 | 0 表示永久保留 |
+| RecoveryInterval | AckTimeout/4 | 超时消息恢复检查间隔（自动推导） |
+| Retention | 0 | 主 Stream 保留时间，0 表示永久保留 |
+| DLQRetention | 7d | 死信队列保留时间，过期自动清理 |
 | StreamMaxLen | 0 | 0 表示不裁剪 |
 | Consumer | $HOSTNAME | 自动取主机名 |
 
@@ -256,6 +258,19 @@ fxmq.WithStreamMaxLen(50000)
 fxmq.WithRetention(7 * 24 * time.Hour)
 ```
 
+### 死信队列保留
+
+死信消息默认保留 7 天后自动清理。清理时会同步释放主 Stream 中对应消息的 PEL 条目和重试计数器。空的 DLQ key 自动删除。
+
+```go
+// 自定义保留时间
+fxmq.WithDLQRetention(3 * 24 * time.Hour) // 3 天后自动清理
+```
+
+### 删除空 Topic
+
+当 Topic 的 Stream、死信队列、延迟队列全部为空时，可通过 Dashboard 手动删除该 Topic 对应的所有 Redis key。在 Topic 详情页工具栏点击「删除 Topic」按钮即可。
+
 ## 消息可靠性
 
 forxi-mq 提供 **at-least-once** 语义：
@@ -265,6 +280,8 @@ forxi-mq 提供 **at-least-once** 语义：
 | 不丢消息 | Consumer Group + Pending List + XAUTOCLAIM 恢复 |
 | 自动重试 | 消息超时后由 Recovery 自动重新投递，重试计数精确追踪 |
 | 死信兜底 | 超过重试次数进入 DLQ，不会无限循环 |
+| DLQ 自清理 | 死信消息过期后自动清理，释放 PEL 和 Redis 内存 |
+| 多 Group 隔离 | 重试计数和死信队列按 Group 隔离，互不影响 |
 | 优雅退出 | Context 取消 + WaitGroup 等待所有 worker 和后台任务完成 |
 
 > **注意**：不重复需要业务侧保证幂等（通过 `msg.ID` 或业务唯一键去重）。

@@ -26,13 +26,16 @@ type Config struct {
 	// Timeout
 	AckTimeout time.Duration // pending message timeout (default: 60s)
 
-	// Background task intervals
-	DelayPollInterval time.Duration // delay queue poll interval (default: 500ms)
-	RecoveryInterval  time.Duration // pending recovery interval (default: 15s)
+	// Internal intervals (auto-derived, not user-configurable)
+	DelayPollInterval time.Duration
+	RecoveryInterval  time.Duration
 
 	// Stream trimming (two strategies, can be used together)
 	StreamMaxLen int64         // MAXLEN~ trim by count (default: 0 = unlimited)
 	Retention    time.Duration // MINID trim by time (default: 0 = unlimited)
+
+	// DLQ retention: how long dead letter messages are kept (default: 7 days)
+	DLQRetention time.Duration
 }
 
 // defaultConsumerName returns a unique consumer name from environment.
@@ -60,12 +63,12 @@ func (c *Config) ApplyDefaults() {
 	if c.AckTimeout <= 0 {
 		c.AckTimeout = 60 * time.Second
 	}
-	if c.DelayPollInterval <= 0 {
-		c.DelayPollInterval = 500 * time.Millisecond
+	if c.DLQRetention <= 0 {
+		c.DLQRetention = 7 * 24 * time.Hour
 	}
-	if c.RecoveryInterval <= 0 {
-		c.RecoveryInterval = 15 * time.Second
-	}
+	// Internal intervals derived from AckTimeout
+	c.DelayPollInterval = 500 * time.Millisecond
+	c.RecoveryInterval = max(c.AckTimeout/4, time.Second)
 }
 
 // Validate checks required fields.

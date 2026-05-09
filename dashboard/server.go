@@ -17,15 +17,17 @@ var staticFiles embed.FS
 // Server is the dashboard HTTP server.
 type Server struct {
 	rdb    *redis.Client
+	group  string
 	logger log.Logger
 	addr   string
 	srv    *http.Server
 }
 
 // New creates a new dashboard Server.
-func New(rdb *redis.Client, addr string, logger log.Logger) *Server {
+func New(rdb *redis.Client, addr string, group string, logger log.Logger) *Server {
 	return &Server{
 		rdb:    rdb,
+		group:  group,
 		logger: logger,
 		addr:   addr,
 	}
@@ -37,6 +39,7 @@ func (s *Server) Start(ctx context.Context) <-chan struct{} {
 	mux := http.NewServeMux()
 
 	// API routes
+	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("GET /api/overview", s.handleOverview)
 	mux.HandleFunc("GET /api/topics", s.handleTopics)
 	mux.HandleFunc("GET /api/topics/{topic}", s.handleTopicDetail)
@@ -52,6 +55,7 @@ func (s *Server) Start(ctx context.Context) <-chan struct{} {
 	mux.HandleFunc("DELETE /api/topics/{topic}/dead/{id}", s.handleDeleteDead)
 	mux.HandleFunc("POST /api/topics/{topic}/delay/delete", s.handleDeleteDelay)
 	mux.HandleFunc("POST /api/topics/{topic}/groups/{group}/reset", s.handleResetGroup)
+	mux.HandleFunc("DELETE /api/topics/{topic}", s.handleDeleteTopic)
 
 	// Static files (Vue dist)
 	dist, _ := fs.Sub(staticFiles, "ui/dist")

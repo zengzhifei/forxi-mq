@@ -26,13 +26,14 @@ type overviewResp struct {
 }
 
 type topicInfo struct {
-	Name    string      `json:"name"`
-	Stored  int64       `json:"stored"`
-	Lag     int64       `json:"lag"`
-	Pending int64       `json:"pending"`
-	Dead    int64       `json:"dead"`
-	Delay   int64       `json:"delay"`
-	Groups  []groupInfo `json:"groups,omitempty"`
+	Name      string      `json:"name"`
+	Stored    int64       `json:"stored"`
+	Lag       int64       `json:"lag"`
+	Pending   int64       `json:"pending"`
+	Dead      int64       `json:"dead"`
+	Delay     int64       `json:"delay"`
+	SelfGroup string      `json:"self_group,omitempty"`
+	Groups    []groupInfo `json:"groups,omitempty"`
 }
 
 type groupInfo struct {
@@ -63,6 +64,10 @@ type delayMessage struct {
 
 // --- Handlers ---
 
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"group": s.group})
+}
+
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	topics := s.discoverTopics(ctx)
@@ -70,7 +75,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 	for _, topic := range topics {
 		length, _ := s.rdb.XLen(ctx, internal.StreamKey(topic)).Result()
-		dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
+		dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic, s.group)).Result()
 		delay, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
 		resp.TotalMsgs += length
 		resp.TotalDead += dead
@@ -97,6 +102,7 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 	info := s.getTopicInfo(ctx, topic)
+	info.SelfGroup = s.group
 
 	// Get all groups and their consumers
 	groups, err := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
@@ -118,6 +124,11 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			info.Groups = append(info.Groups, gi)
+			// Override top-level stats with self group's values
+			if g.Name == s.group {
+				info.Lag = g.Lag
+				info.Pending = g.Pending
+			}
 		}
 	}
 
@@ -127,6 +138,7 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
+	streamKey := internal.StreamKey(topic)
 
 	count := int64(20)
 	if c := r.URL.Query().Get("count"); c != "" {
@@ -135,14 +147,20 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Get self group's last-delivered-id to scope messages
+	lastDelivered := s.getGroupLastDeliveredID(ctx, streamKey)
+
 	// Cursor-based pagination: cursor is the last ID from previous page
 	// For XREVRANGE, cursor means "get messages before this ID"
-	end := "+"
+	end := lastDelivered
+	if end == "" {
+		end = "+"
+	}
 	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
 		end = "(" + cursor // exclusive
 	}
 
-	msgs, err := s.rdb.XRevRangeN(ctx, internal.StreamKey(topic), end, "-", count).Result()
+	msgs, err := s.rdb.XRevRangeN(ctx, streamKey, end, "-", count).Result()
 	if err != nil {
 		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
 		return
@@ -177,19 +195,11 @@ func (s *Server) handleLag(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Find the last-delivered-id across all groups (use the smallest one)
-	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
-	if err != nil || len(groups) == 0 {
+	// Use self group's last-delivered-id
+	lastID := s.getGroupLastDeliveredID(ctx, streamKey)
+	if lastID == "" {
 		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
 		return
-	}
-
-	// Get the earliest last-delivered-id (messages after this are "lag")
-	lastID := groups[0].LastDeliveredID
-	for _, g := range groups[1:] {
-		if compareStreamID(g.LastDeliveredID, lastID) < 0 {
-			lastID = g.LastDeliveredID
-		}
 	}
 
 	// Cursor-based pagination for lag
@@ -244,46 +254,38 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 		startID = "(" + cursor
 	}
 
-	// Get all groups, then get pending messages from each
-	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
+	// Only query self group's pending messages
+	var result []map[string]any
+	pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: streamKey,
+		Group:  s.group,
+		Start:  startID,
+		End:    "+",
+		Count:  count,
+	}).Result()
 	if err != nil {
 		writeJSON(w, map[string]any{"items": []map[string]any{}, "next_cursor": ""})
 		return
 	}
 
-	var result []map[string]any
-	for _, g := range groups {
-		pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
-			Stream: streamKey,
-			Group:  g.Name,
-			Start:  startID,
-			End:    "+",
-			Count:  count,
-		}).Result()
-		if err != nil {
+	// Fetch message bodies
+	for _, p := range pending {
+		msgs, err := s.rdb.XRangeN(ctx, streamKey, p.ID, p.ID, 1).Result()
+		if err != nil || len(msgs) == 0 {
 			continue
 		}
 
-		// Fetch message bodies
-		for _, p := range pending {
-			msgs, err := s.rdb.XRangeN(ctx, streamKey, p.ID, p.ID, 1).Result()
-			if err != nil || len(msgs) == 0 {
-				continue
-			}
+		// Get real retry count from forxi-mq retry counter
+		retryCount, _ := s.rdb.Get(ctx, internal.RetryCountKey(topic, s.group, p.ID)).Int()
 
-			// Get real retry count from forxi-mq retry counter
-			retryCount, _ := s.rdb.Get(ctx, internal.RetryCountKey(topic, p.ID)).Int()
-
-			item := map[string]any{
-				"id":          p.ID,
-				"group":       g.Name,
-				"consumer":    p.Consumer,
-				"idle":        p.Idle.String(),
-				"retry_count": retryCount,
-				"values":      filterValues(msgs[0].Values),
-			}
-			result = append(result, item)
+		item := map[string]any{
+			"id":          p.ID,
+			"consumer":    p.Consumer,
+			"idle":        p.Idle.String(),
+			"retry_count": retryCount,
+			"values":      filterValues(msgs[0].Values),
 		}
+		result = append(result, item)
 	}
 
 	var nextCursor string
@@ -310,7 +312,7 @@ func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
 		start = "(" + cursor
 	}
 
-	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), start, "+", count).Result()
+	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic, s.group), start, "+", count).Result()
 	if err != nil {
 		writeJSON(w, map[string]any{"items": []deadMessage{}, "next_cursor": ""})
 		return
@@ -340,10 +342,9 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 
-	deadKey := internal.DeadLetterKey(topic)
-	streamKey := internal.StreamKey(topic)
+	deadKey := internal.DeadLetterKey(topic, s.group)
 
-	// Batch requeue dead messages (max 200 per request to avoid OOM)
+	// Batch requeue dead messages (max 200 per request)
 	msgs, err := s.rdb.XRangeN(ctx, deadKey, "-", "+", 200).Result()
 	if err != nil || len(msgs) == 0 {
 		writeJSON(w, map[string]int{"requeued": 0})
@@ -356,14 +357,19 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		err := s.rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: streamKey,
-			Values: map[string]interface{}{"body": body},
-		}).Err()
-		if err == nil {
-			s.rdb.XDel(ctx, deadKey, msg.ID)
-			count++
+
+		// Extract original message ID and clear retry/dead state
+		var origMsg mq.Message
+		if err := json.Unmarshal([]byte(body), &origMsg); err == nil && origMsg.ID != "" {
+			// Clear retry counter and dead mark — message is still in PEL,
+			// Recovery will pick it up on next cycle and enqueue for retry.
+			retryKey := internal.RetryCountKey(topic, s.group, origMsg.ID)
+			s.rdb.Del(ctx, retryKey)
 		}
+
+		// Remove from DLQ
+		s.rdb.XDel(ctx, deadKey, msg.ID)
+		count++
 	}
 
 	writeJSON(w, map[string]int{"requeued": count})
@@ -459,7 +465,7 @@ func (s *Server) handleSearchMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Search in dead letter
-	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic), id, id, 1).Result()
+	msgs, err := s.rdb.XRangeN(ctx, internal.DeadLetterKey(topic, s.group), id, id, 1).Result()
 	if err == nil && len(msgs) > 0 {
 		dm := map[string]any{"id": msgs[0].ID}
 		if body, ok := msgs[0].Values["body"].(string); ok {
@@ -550,7 +556,7 @@ func (s *Server) findInStream(ctx context.Context, streamKey, topic, id string) 
 // getMessageStatus determines if a stream message is consumed, pending, retrying, or dead.
 func (s *Server) getMessageStatus(ctx context.Context, streamKey, topic, msgID string) string {
 	// Check retry counter first
-	retryKey := internal.RetryCountKey(topic, msgID)
+	retryKey := internal.RetryCountKey(topic, s.group, msgID)
 	retryVal, err := s.rdb.Get(ctx, retryKey).Result()
 	if err == nil {
 		if retryVal == "-1" {
@@ -663,7 +669,7 @@ func (s *Server) handleDeleteDead(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	ctx := r.Context()
 
-	err := s.rdb.XDel(ctx, internal.DeadLetterKey(topic), id).Err()
+	err := s.rdb.XDel(ctx, internal.DeadLetterKey(topic, s.group), id).Err()
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -702,6 +708,12 @@ func (s *Server) handleResetGroup(w http.ResponseWriter, r *http.Request) {
 	group := r.PathValue("group")
 	ctx := r.Context()
 
+	// Only allow resetting self group
+	if group != s.group {
+		writeJSON(w, map[string]any{"ok": false, "error": "can only reset own group"})
+		return
+	}
+
 	var req struct {
 		ID string `json:"id"` // "0" = reset to beginning, "$" = latest
 	}
@@ -717,7 +729,58 @@ func (s *Server) handleResetGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
+func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ctx := r.Context()
+
+	streamKey := internal.StreamKey(topic)
+	dlqKey := internal.DeadLetterKey(topic, s.group)
+	delayKey := internal.DelayKey(topic)
+	delayDataKey := internal.DelayDataKey(topic)
+
+	// Check stream is empty
+	streamLen, _ := s.rdb.XLen(ctx, streamKey).Result()
+	if streamLen > 0 {
+		writeJSON(w, map[string]any{"ok": false, "error": "stream is not empty, cannot delete"})
+		return
+	}
+
+	// Check DLQ is empty
+	dlqLen, _ := s.rdb.XLen(ctx, dlqKey).Result()
+	if dlqLen > 0 {
+		writeJSON(w, map[string]any{"ok": false, "error": "dead letter queue is not empty, cannot delete"})
+		return
+	}
+
+	// Check delay queue is empty
+	delayLen, _ := s.rdb.ZCard(ctx, delayKey).Result()
+	if delayLen > 0 {
+		writeJSON(w, map[string]any{"ok": false, "error": "delay queue is not empty, cannot delete"})
+		return
+	}
+
+	// All empty — safe to delete keys
+	s.rdb.Del(ctx, streamKey, dlqKey, delayKey, delayDataKey)
+
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 // --- Helpers ---
+
+// getGroupLastDeliveredID returns the last-delivered-id for the self group on the given stream.
+// Returns "" if the group doesn't exist on this stream.
+func (s *Server) getGroupLastDeliveredID(ctx context.Context, streamKey string) string {
+	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
+	if err != nil {
+		return ""
+	}
+	for _, g := range groups {
+		if g.Name == s.group {
+			return g.LastDeliveredID
+		}
+	}
+	return ""
+}
 
 // discoverTopics scans Redis for all fxmq:* keys and extracts topic names.
 func (s *Server) discoverTopics(ctx context.Context) []string {
@@ -813,7 +876,7 @@ func compareStreamID(a, b string) int {
 
 func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
 	length, _ := s.rdb.XLen(ctx, internal.StreamKey(topic)).Result()
-	dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
+	dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic, s.group)).Result()
 	delayCount, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
 
 	// Sum pending and lag across all groups

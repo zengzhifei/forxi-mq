@@ -59,6 +59,7 @@ func (c *Config) applyDefaults() {
 type Alerter struct {
 	rdb    *redis.Client
 	cfg    Config
+	group  string
 	topics []string
 	logger log.Logger
 
@@ -67,11 +68,12 @@ type Alerter struct {
 }
 
 // New creates a new Alerter.
-func New(rdb *redis.Client, topics []string, cfg Config, logger log.Logger) *Alerter {
+func New(rdb *redis.Client, topics []string, group string, cfg Config, logger log.Logger) *Alerter {
 	cfg.applyDefaults()
 	return &Alerter{
 		rdb:      rdb,
 		cfg:      cfg,
+		group:    group,
 		topics:   topics,
 		logger:   logger,
 		lastSent: make(map[string]time.Time),
@@ -108,7 +110,7 @@ func (a *Alerter) check(ctx context.Context) {
 		}
 
 		// Check dead
-		totalDead, _ := a.rdb.XLen(ctx, internal.DeadLetterKey(topic)).Result()
+		totalDead, _ := a.rdb.XLen(ctx, internal.DeadLetterKey(topic, a.group)).Result()
 
 		// Evaluate thresholds
 		var reasons []string

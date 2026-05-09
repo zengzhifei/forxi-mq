@@ -2,6 +2,7 @@ package fxmq
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"sync"
 	"time"
@@ -50,11 +51,6 @@ func WithAckTimeout(d time.Duration) Option {
 	return func(e *Engine) { e.cfg.AckTimeout = d }
 }
 
-// WithRecoveryInterval sets how often recovery checks for pending messages (default: 15s).
-func WithRecoveryInterval(d time.Duration) Option {
-	return func(e *Engine) { e.cfg.RecoveryInterval = d }
-}
-
 // WithStreamMaxLen sets the stream MAXLEN~ trimming (default: 0 = unlimited).
 func WithStreamMaxLen(n int64) Option {
 	return func(e *Engine) { e.cfg.StreamMaxLen = n }
@@ -64,6 +60,11 @@ func WithStreamMaxLen(n int64) Option {
 // Uses XTRIM MINID (Redis 6.2+). Default: 0 = keep forever.
 func WithRetention(d time.Duration) Option {
 	return func(e *Engine) { e.cfg.Retention = d }
+}
+
+// WithDLQRetention sets how long dead letter messages are kept (default: 7 days).
+func WithDLQRetention(d time.Duration) Option {
+	return func(e *Engine) { e.cfg.DLQRetention = d }
 }
 
 // WithRedisPassword sets the Redis password.
@@ -165,8 +166,8 @@ func NewEngine(redisAddr, group string, opts ...Option) (*Engine, error) {
 	if retryTTL <= 0 {
 		retryTTL = 7 * 24 * time.Hour // default 7 days
 	}
-	rs := retry.New(e.rdb, retryTTL)
-	dlq := deadletter.New(e.rdb, e.logger)
+	rs := retry.New(e.rdb, e.cfg.Group, retryTTL)
+	dlq := deadletter.New(e.rdb, e.cfg.Group, e.logger)
 	p := producer.New(e.rdb, e.cfg.StreamMaxLen)
 	c := consumer.New(e.rdb, e.cfg, e.logger, rs)
 
@@ -218,16 +219,15 @@ func (e *Engine) Start(ctx context.Context) {
 		e.recovery.Run(ctx)
 	}()
 
-	if e.cfg.Retention > 0 {
-		e.bgWg.Add(1)
-		go func() {
-			defer e.bgWg.Done()
-			e.runRetentionTrimmer(ctx)
-		}()
-	}
+	// Always run retention trimmer: DLQ uses 7-day default, main stream uses configured retention
+	e.bgWg.Add(1)
+	go func() {
+		defer e.bgWg.Done()
+		e.runRetentionTrimmer(ctx)
+	}()
 
 	if e.dashboardAddr != "" {
-		dash := dashboard.New(e.rdb, e.dashboardAddr, e.logger)
+		dash := dashboard.New(e.rdb, e.dashboardAddr, e.cfg.Group, e.logger)
 		dashDone := dash.Start(ctx)
 		e.bgWg.Add(1)
 		go func() {
@@ -237,7 +237,7 @@ func (e *Engine) Start(ctx context.Context) {
 	}
 
 	if e.alertCfg != nil {
-		alerter := alert.New(e.rdb, e.topics, *e.alertCfg, e.logger)
+		alerter := alert.New(e.rdb, e.topics, e.cfg.Group, *e.alertCfg, e.logger)
 		e.bgWg.Add(1)
 		go func() {
 			defer e.bgWg.Done()
@@ -250,10 +250,13 @@ func (e *Engine) Start(ctx context.Context) {
 
 // runRetentionTrimmer periodically trims streams using MINID based on retention duration.
 func (e *Engine) runRetentionTrimmer(ctx context.Context) {
-	// Trim every 1/10 of retention period, minimum 1 minute
-	interval := e.cfg.Retention / 10
-	if interval < time.Minute {
-		interval = time.Minute
+	// Use retention interval or default 1 hour for DLQ-only trimming
+	interval := time.Hour
+	if e.cfg.Retention > 0 {
+		interval = e.cfg.Retention / 10
+		if interval < time.Minute {
+			interval = time.Minute
+		}
 	}
 
 	ticker := time.NewTicker(interval)
@@ -270,8 +273,43 @@ func (e *Engine) runRetentionTrimmer(ctx context.Context) {
 }
 
 func (e *Engine) trimByRetention(ctx context.Context) {
-	minID := strconv.FormatInt(time.Now().Add(-e.cfg.Retention).UnixMilli(), 10) + "-0"
+	// Trim DLQ (always, using configured DLQ retention)
+	// Before trimming, ACK the expired dead messages from main stream PEL
+	dlqMinID := strconv.FormatInt(time.Now().Add(-e.cfg.DLQRetention).UnixMilli(), 10) + "-0"
+	for _, topic := range e.topics {
+		dlqKey := internal.DeadLetterKey(topic, e.cfg.Group)
+		streamKey := internal.StreamKey(topic)
 
+		// Find DLQ entries that will be trimmed (older than dlqMinID)
+		expired, _ := e.rdb.XRangeN(ctx, dlqKey, "-", "("+dlqMinID, 100).Result()
+		for _, msg := range expired {
+			// Extract original message ID and ACK from main stream PEL
+			if body, ok := msg.Values["body"].(string); ok {
+				var origMsg mq.Message
+				if err := json.Unmarshal([]byte(body), &origMsg); err == nil && origMsg.ID != "" {
+					e.rdb.XAck(ctx, streamKey, e.cfg.Group, origMsg.ID)
+					// Also clean retry key
+					retryKey := internal.RetryCountKey(topic, e.cfg.Group, origMsg.ID)
+					e.rdb.Del(ctx, retryKey)
+				}
+			}
+		}
+
+		if err := e.rdb.XTrimMinID(ctx, dlqKey, dlqMinID).Err(); err != nil {
+			e.logger.Error("dlq trim failed", "key", dlqKey, "error", err)
+		}
+
+		// Clean up empty DLQ key
+		if dlqLen, _ := e.rdb.XLen(ctx, dlqKey).Result(); dlqLen == 0 {
+			e.rdb.Del(ctx, dlqKey)
+		}
+	}
+
+	// Trim main stream (only if retention is configured)
+	if e.cfg.Retention <= 0 {
+		return
+	}
+	minID := strconv.FormatInt(time.Now().Add(-e.cfg.Retention).UnixMilli(), 10) + "-0"
 	for _, topic := range e.topics {
 		stream := internal.StreamKey(topic)
 		err := e.rdb.XTrimMinID(ctx, stream, minID).Err()
@@ -279,6 +317,7 @@ func (e *Engine) trimByRetention(ctx context.Context) {
 			e.logger.Error("retention trim failed",
 				"stream", stream, "min_id", minID, "error", err)
 		}
+
 	}
 }
 
