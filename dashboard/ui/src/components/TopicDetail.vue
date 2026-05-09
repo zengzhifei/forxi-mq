@@ -23,6 +23,7 @@ let timer = null
 // Publish dialog
 const publishVisible = ref(false)
 const publishBody = ref('')
+const publishDelay = ref('')
 const publishLoading = ref(false)
 
 // Pagination state
@@ -199,18 +200,32 @@ async function publishMessage() {
     ElMessage.warning('消息体不能为空')
     return
   }
+  // Validate payload is valid JSON
+  let payload
+  try {
+    payload = JSON.parse(publishBody.value)
+  } catch {
+    ElMessage.warning('Payload 必须是合法 JSON')
+    return
+  }
   publishLoading.value = true
   try {
+    const reqBody = { payload }
+    if (publishDelay.value.trim()) {
+      reqBody.delay = publishDelay.value.trim()
+    }
     const res = await fetch(`/api/topics/${props.topic}/publish`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ body: publishBody.value })
+      body: JSON.stringify(reqBody)
     })
     const data = await res.json()
     if (data.ok) {
-      ElMessage.success(`发布成功, ID: ${data.id}`)
+      const typeLabel = data.type === 'delay' ? '延迟消息' : '普通消息'
+      ElMessage.success(`${typeLabel}发布成功, ID: ${data.id}`)
       publishVisible.value = false
       publishBody.value = ''
+      publishDelay.value = ''
       fetchAll()
     } else {
       ElMessage.error(data.error || '发布失败')
@@ -707,12 +722,23 @@ onUnmounted(() => clearInterval(timer))
 
     <!-- Publish Dialog -->
     <el-dialog v-model="publishVisible" title="发布消息" width="500" append-to-body>
-      <el-input
-        v-model="publishBody"
-        type="textarea"
-        :rows="8"
-        placeholder="输入消息内容 (JSON 或纯文本)"
-      />
+      <el-form label-position="top">
+        <el-form-item label="Payload (JSON)">
+          <el-input
+            v-model="publishBody"
+            type="textarea"
+            :rows="8"
+            placeholder='{"order_id": "12345", "amount": 99.9}'
+          />
+        </el-form-item>
+        <el-form-item label="延迟时间（可选，留空为立即投递）">
+          <el-input
+            v-model="publishDelay"
+            placeholder="例: 30s, 5m, 1h"
+            style="width: 200px;"
+          />
+        </el-form-item>
+      </el-form>
       <template #footer>
         <el-button @click="publishVisible = false">取消</el-button>
         <el-button type="primary" :loading="publishLoading" @click="publishMessage">发布</el-button>

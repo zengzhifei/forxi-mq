@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/internal"
+	"github.com/zengzhifei/forxi-mq/mq"
 )
 
 // --- Response types ---
@@ -149,7 +152,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	for _, msg := range msgs {
 		item := map[string]any{
 			"id":     msg.ID,
-			"values": msg.Values,
+			"values": filterValues(msg.Values),
 		}
 		result = append(result, item)
 	}
@@ -210,7 +213,7 @@ func (s *Server) handleLag(w http.ResponseWriter, r *http.Request) {
 	for _, msg := range msgs {
 		item := map[string]any{
 			"id":     msg.ID,
-			"values": msg.Values,
+			"values": filterValues(msg.Values),
 		}
 		result = append(result, item)
 	}
@@ -267,13 +270,21 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 			if err != nil || len(msgs) == 0 {
 				continue
 			}
+
+			// Get real retry count from forxi-mq retry counter
+			retryKey := p.ID
+			if rk, ok := msgs[0].Values["_retry_key"].(string); ok {
+				retryKey = rk
+			}
+			retryCount, _ := s.rdb.Get(ctx, internal.RetryCountKey(topic, retryKey)).Int()
+
 			item := map[string]any{
 				"id":          p.ID,
 				"group":       g.Name,
 				"consumer":    p.Consumer,
 				"idle":        p.Idle.String(),
-				"retry_count": p.RetryCount,
-				"values":      msgs[0].Values,
+				"retry_count": retryCount,
+				"values":      filterValues(msgs[0].Values),
 			}
 			result = append(result, item)
 		}
@@ -483,23 +494,65 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var req struct {
-		Body string `json:"body"`
+		Payload  json.RawMessage   `json:"payload"`
+		Metadata map[string]string `json:"metadata,omitempty"`
+		Delay    string            `json:"delay"` // e.g. "30s", "5m", "1h"
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
-		http.Error(w, "invalid body", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Payload) == 0 {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
 
-	id, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: internal.StreamKey(topic),
-		Values: map[string]interface{}{"body": req.Body},
-	}).Result()
+	msg := &mq.Message{
+		Topic:     topic,
+		Payload:   req.Payload,
+		Metadata:  req.Metadata,
+		CreatedAt: time.Now(),
+	}
+
+	body, err := json.Marshal(msg)
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 
-	writeJSON(w, map[string]any{"ok": true, "id": id})
+	// Delay publish
+	if req.Delay != "" {
+		dur, err := time.ParseDuration(req.Delay)
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": "invalid delay: " + err.Error()})
+			return
+		}
+
+		id := generateDelayID()
+		score := float64(time.Now().Add(dur).UnixMilli())
+		delayKey := internal.DelayKey(topic)
+		dataKey := internal.DelayDataKey(topic)
+
+		pipe := s.rdb.Pipeline()
+		pipe.ZAdd(ctx, delayKey, redis.Z{Score: score, Member: id})
+		pipe.HSet(ctx, dataKey, id, string(body))
+		_, err = pipe.Exec(ctx)
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "id": id, "type": "delay"})
+		return
+	}
+
+	// Normal publish
+	args := &redis.XAddArgs{
+		Stream: internal.StreamKey(topic),
+		Values: map[string]interface{}{"body": string(body)},
+	}
+	id, err := s.rdb.XAdd(ctx, args).Result()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"ok": true, "id": id, "type": "normal"})
 }
 
 func (s *Server) handleDeleteDead(w http.ResponseWriter, r *http.Request) {
@@ -674,6 +727,24 @@ func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
 		Dead:    dead,
 		Delay:   delayCount,
 	}
+}
+
+// filterValues removes internal fields (e.g. _retry_key) from stream values before returning to frontend.
+func filterValues(values map[string]interface{}) map[string]interface{} {
+	filtered := make(map[string]interface{}, len(values))
+	for k, v := range values {
+		if strings.HasPrefix(k, "_") {
+			continue
+		}
+		filtered[k] = v
+	}
+	return filtered
+}
+
+func generateDelayID() string {
+	b := make([]byte, 12)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func writeJSON(w http.ResponseWriter, data interface{}) {
