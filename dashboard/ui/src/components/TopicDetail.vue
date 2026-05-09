@@ -23,7 +23,7 @@ let timer = null
 // Publish dialog
 const publishVisible = ref(false)
 const publishBody = ref('')
-const publishDelay = ref('')
+const publishDueAt = ref(null)
 const publishLoading = ref(false)
 
 // Pagination state
@@ -211,8 +211,14 @@ async function publishMessage() {
   publishLoading.value = true
   try {
     const reqBody = { payload }
-    if (publishDelay.value.trim()) {
-      reqBody.delay = publishDelay.value.trim()
+    if (publishDueAt.value) {
+      const dueMs = new Date(publishDueAt.value).getTime()
+      if (dueMs <= Date.now()) {
+        ElMessage.warning('投递时间必须在当前时间之后')
+        publishLoading.value = false
+        return
+      }
+      reqBody.due_at = dueMs
     }
     const res = await fetch(`/api/topics/${props.topic}/publish`, {
       method: 'POST',
@@ -222,11 +228,15 @@ async function publishMessage() {
     const data = await res.json()
     if (data.ok) {
       const typeLabel = data.type === 'delay' ? '延迟消息' : '普通消息'
-      ElMessage.success(`${typeLabel}发布成功, ID: ${data.id}`)
       publishVisible.value = false
       publishBody.value = ''
-      publishDelay.value = ''
+      publishDueAt.value = null
       fetchAll()
+      ElMessageBox.alert(
+        `<div style="word-break:break-all;font-family:monospace;font-size:13px;padding:8px;background:var(--el-bg-color-page);border-radius:4px;cursor:pointer;" onclick="navigator.clipboard.writeText('${data.id}')">${data.id}</div><div style="margin-top:8px;font-size:12px;color:var(--el-text-color-secondary);">点击 ID 可复制</div>`,
+        `${typeLabel}发布成功`,
+        { dangerouslyUseHTMLString: true, confirmButtonText: '确定' }
+      )
     } else {
       ElMessage.error(data.error || '发布失败')
     }
@@ -731,11 +741,13 @@ onUnmounted(() => clearInterval(timer))
             placeholder='{"order_id": "12345", "amount": 99.9}'
           />
         </el-form-item>
-        <el-form-item label="延迟时间（可选，留空为立即投递）">
-          <el-input
-            v-model="publishDelay"
-            placeholder="例: 30s, 5m, 1h"
-            style="width: 200px;"
+        <el-form-item label="定时投递（可选，不选则立即投递）">
+          <el-date-picker
+            v-model="publishDueAt"
+            type="datetime"
+            placeholder="选择投递时间"
+            format="YYYY-MM-DD HH:mm:ss"
+            :disabled-date="(date) => date.getTime() < Date.now() - 86400000"
           />
         </el-form-item>
       </el-form>

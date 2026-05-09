@@ -496,7 +496,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Payload  json.RawMessage   `json:"payload"`
 		Metadata map[string]string `json:"metadata,omitempty"`
-		Delay    string            `json:"delay"` // e.g. "30s", "5m", "1h"
+		DueAt    int64             `json:"due_at"` // unix milliseconds, 0 means immediate
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Payload) == 0 {
 		http.Error(w, "invalid payload", http.StatusBadRequest)
@@ -516,16 +516,16 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delay publish
-	if req.Delay != "" {
-		dur, err := time.ParseDuration(req.Delay)
-		if err != nil {
-			writeJSON(w, map[string]any{"ok": false, "error": "invalid delay: " + err.Error()})
+	// Delay publish if due_at is set and in the future
+	if req.DueAt > 0 {
+		dueTime := time.UnixMilli(req.DueAt)
+		if !dueTime.After(time.Now()) {
+			writeJSON(w, map[string]any{"ok": false, "error": "due_at must be in the future"})
 			return
 		}
 
 		id := generateDelayID()
-		score := float64(time.Now().Add(dur).UnixMilli())
+		score := float64(req.DueAt)
 		delayKey := internal.DelayKey(topic)
 		dataKey := internal.DelayDataKey(topic)
 
