@@ -24,6 +24,7 @@ type Consumer struct {
 	group       string
 	consumer    string
 	concurrency int
+	ackTimeout  time.Duration
 	logger      log.Logger
 	retry       *retry.Strategy
 
@@ -39,6 +40,7 @@ func New(rdb *redis.Client, cfg mq.Config, logger log.Logger, rs *retry.Strategy
 		group:       cfg.Group,
 		consumer:    cfg.Consumer,
 		concurrency: cfg.Concurrency,
+		ackTimeout:  cfg.AckTimeout,
 		logger:      logger,
 		retry:       rs,
 	}
@@ -117,13 +119,23 @@ func (c *Consumer) worker(ctx context.Context, stream, topic, name string, handl
 
 // pendingReader reads pending messages (start="0") assigned to this consumer.
 // Recovery claims timed-out messages to this consumer via XAUTOCLAIM, so this
-// goroutine picks them up for reprocessing. It polls periodically.
+// goroutine picks them up for reprocessing.
+//
+// Key design: each message is only attempted ONCE per Recovery claim cycle.
+// After a handler failure, the message ID is recorded locally and skipped until
+// Recovery increments the retry counter (indicating a new claim cycle).
 func (c *Consumer) pendingReader(ctx context.Context, stream, topic, name string, handler Handler) {
 	defer c.wg.Done()
 
-	const baseInterval = 2 * time.Second
-	const maxInterval = 30 * time.Second
-	interval := baseInterval
+	// Track failed message IDs and the retry count at failure time.
+	// Only re-attempt when Recovery increments the count (new claim cycle).
+	type failedEntry struct {
+		countAtFailure int
+	}
+	failed := make(map[string]failedEntry)
+	const maxFailedEntries = 1000 // safety cap to prevent unbounded growth
+
+	const pollInterval = 2 * time.Second
 
 	for {
 		select {
@@ -146,36 +158,50 @@ func (c *Consumer) pendingReader(ctx context.Context, stream, topic, name string
 			if err != redis.Nil {
 				c.logger.Error("xreadgroup pending error", "stream", stream, "error", err)
 			}
-			time.Sleep(interval)
+			time.Sleep(pollInterval)
 			continue
 		}
 
 		hasMessages := false
-		allFailed := true
 		for _, s := range results {
 			for _, xmsg := range s.Messages {
 				hasMessages = true
-				if c.process(ctx, topic, stream, xmsg, handler) {
-					allFailed = false
+
+				// Check if we've already failed on this message in the current cycle
+				if entry, skipped := failed[xmsg.ID]; skipped {
+					// Check if Recovery has incremented the count (new claim cycle)
+					currentCount, _ := c.retry.GetCount(ctx, topic, xmsg.ID)
+					if currentCount <= entry.countAtFailure {
+						// Same cycle — skip
+						continue
+					}
+					// Recovery has incremented — new cycle, retry is allowed
+					delete(failed, xmsg.ID)
+				}
+
+				if !c.process(ctx, topic, stream, xmsg, handler) {
+					// Handler failed — record current retry count and skip until next cycle
+					count, _ := c.retry.GetCount(ctx, topic, xmsg.ID)
+					failed[xmsg.ID] = failedEntry{countAtFailure: count}
+				} else {
+					// Success or ACKed (dead/invalid) — remove from tracking
+					delete(failed, xmsg.ID)
 				}
 			}
 		}
 
 		if !hasMessages {
-			// No pending messages, reset interval and sleep
-			interval = baseInterval
-			time.Sleep(interval)
-		} else if allFailed {
-			// All messages failed — back off to avoid busy-loop
-			interval = interval * 2
-			if interval > maxInterval {
-				interval = maxInterval
-			}
-			time.Sleep(interval)
-		} else {
-			// Some messages succeeded, reset interval
-			interval = baseInterval
+			// No pending messages — clear failed tracking (messages were ACKed externally)
+			failed = make(map[string]failedEntry)
 		}
+
+		// Safety: if map grows too large (shouldn't happen normally), clear it.
+		// Worst case: some messages get retried once extra (at-least-once is fine).
+		if len(failed) > maxFailedEntries {
+			failed = make(map[string]failedEntry)
+		}
+
+		time.Sleep(pollInterval)
 	}
 }
 
@@ -201,7 +227,13 @@ func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis
 		return true
 	}
 
-	if err := handler(ctx, &msg); err != nil {
+	// Enforce processing timeout to prevent handler from blocking indefinitely.
+	// Timeout is set to ackTimeout so that if handler hangs, the goroutine is freed
+	// before Recovery tries to claim the message again.
+	handlerCtx, cancel := context.WithTimeout(ctx, c.ackTimeout)
+	defer cancel()
+
+	if err := handler(handlerCtx, &msg); err != nil {
 		c.handleFailure(ctx, topic, stream, &msg, err)
 		return false
 	}
