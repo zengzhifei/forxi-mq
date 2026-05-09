@@ -16,7 +16,7 @@
 
 - **轻量** — 不依赖额外 Broker，Redis 即消息服务端
 - **开箱即用** — 两行代码接入，所有配置都有合理默认值
-- **功能完整** — 延迟队列、重试、死信队列、优雅退出
+- **功能完整** — 延迟队列、重试、死信队列、优雅退出、Webhook 告警
 - **可观测** — 内置 Web Dashboard，实时监控队列状态
 - **生产可靠** — Consumer Group 保证消息不丢，XAUTOCLAIM 自动恢复超时消息
 
@@ -135,10 +135,32 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
 
 访问 `http://localhost:9090` 查看：
 
-- 所有 Topic 概览（消息量、Pending、Dead Letter）
-- Consumer 列表及状态
-- 死信消息查看与重新投递
-- 延迟队列待投递消息
+- 所有 Topic 概览（消息量、Lag、Pending、Dead Letter、Delay）
+- Consumer Group 列表及状态
+- 消息列表分页浏览 + 精确搜索
+- 死信消息查看、重新投递、单条删除
+- 延迟队列查看与删除
+- 手动发布消息到任意 Topic
+- 消费组位点重置
+- 当前页导出 JSON
+- 亮色/暗色主题切换
+
+### Webhook 告警
+
+当 Lag、Pending 或死信超过阈值时，自动推送 Webhook 通知：
+
+```go
+engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
+    fxmq.WithAlert(fxmq.AlertConfig{
+        Webhook:          "https://open.feishu.cn/open-apis/bot/v2/hook/xxx",
+        Secret:           "your-sign-secret",
+        Type:             "feishu", // feishu / dingtalk / wecom / ""(通用)
+        LagThreshold:     100,
+        DeadThreshold:    10,
+        PendingThreshold: 50,
+    }),
+)
+```
 
 ## 配置
 
@@ -161,11 +183,12 @@ engine, err := fxmq.NewEngine(redisAddr, group, opts...)
 engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
     fxmq.WithConcurrency(16),                   // 并发 worker 数（默认 8）
     fxmq.WithMaxRetry(5),                       // 最大重试次数（默认 3）
-    fxmq.WithRetryBackoff(2*time.Second),       // 重试退避基数（默认 2s）
     fxmq.WithAckTimeout(60*time.Second),        // 消息超时（默认 60s）
+    fxmq.WithRecoveryInterval(15*time.Second),  // 恢复检查间隔（默认 15s）
     fxmq.WithRetention(7*24*time.Hour),         // 消息保留时间（默认不限）
     fxmq.WithStreamMaxLen(50000),               // Stream 最大条数（默认不限）
     fxmq.WithDashboard(":9090"),                // 开启 Dashboard
+    fxmq.WithAlert(fxmq.AlertConfig{...}),      // 开启 Webhook 告警
     fxmq.WithRedisPassword("secret"),           // Redis 密码
     fxmq.WithRedisDB(1),                        // Redis DB
     fxmq.WithLogger(customLogger),              // 自定义日志
@@ -179,8 +202,8 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
 |--------|--------|------|
 | Concurrency | 8 | 每个 Topic 的消费 worker 数 |
 | MaxRetry | 3 | 超过后进入死信队列 |
-| RetryBackoff | 2s | 指数退避：2s → 4s → 8s |
-| AckTimeout | 60s | 超时未 ACK 触发恢复 |
+| AckTimeout | 60s | 超时未 ACK 触发恢复重试 |
+| RecoveryInterval | 15s | 超时消息恢复检查间隔 |
 | Retention | 0 | 0 表示永久保留 |
 | StreamMaxLen | 0 | 0 表示不裁剪 |
 | Consumer | $HOSTNAME | 自动取主机名 |
@@ -240,9 +263,9 @@ forxi-mq 提供 **at-least-once** 语义：
 | 保障 | 机制 |
 |------|------|
 | 不丢消息 | Consumer Group + Pending List + XAUTOCLAIM 恢复 |
-| 自动重试 | handler 返回 error 触发指数退避重试 |
+| 自动重试 | 消息超时后由 Recovery 自动重新投递，重试计数精确追踪 |
 | 死信兜底 | 超过重试次数进入 DLQ，不会无限循环 |
-| 优雅退出 | Context 取消 + WaitGroup 等待所有 worker 完成 |
+| 优雅退出 | Context 取消 + WaitGroup 等待所有 worker 和后台任务完成 |
 
 > **注意**：不重复需要业务侧保证幂等（通过 `msg.ID` 或业务唯一键去重）。
 
@@ -269,10 +292,11 @@ forxi-mq/
 ├── mq/                    # 核心类型（Config、Message）
 ├── producer/              # 消息发布
 ├── consumer/              # 消费者 + Worker Pool
-├── retry/                 # 重试策略（指数退避）
+├── retry/                 # 重试计数管理
 ├── deadletter/            # 死信队列
-├── delay/                 # 延迟队列（ZSET + Lua）
-├── recovery/              # 超时消息恢复（XAUTOCLAIM）
+├── delay/                 # 延迟队列（ZSET + Hash + Lua）
+├── recovery/              # 超时消息恢复（XAUTOCLAIM + 重发）
+├── alert/                 # Webhook 告警（飞书/钉钉/企微）
 ├── dashboard/             # Web Dashboard（Vue 3 + Element Plus）
 ├── log/                   # 日志接口
 ├── internal/              # Redis Key 命名

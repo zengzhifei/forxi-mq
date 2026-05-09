@@ -127,45 +127,48 @@ func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis
 	}
 	msg.ID = xmsg.ID
 
+	// Use _retry_key if present (message was re-published by recovery)
+	retryKey := xmsg.ID
+	if rk, ok := xmsg.Values["_retry_key"].(string); ok {
+		retryKey = rk
+	}
+
 	if err := handler(ctx, &msg); err != nil {
-		c.handleFailure(ctx, topic, stream, &msg, err)
+		c.handleFailure(ctx, topic, stream, &msg, retryKey, err)
 		return
 	}
 
 	// Success: ACK and clear retry counter
 	c.ack(ctx, stream, xmsg.ID)
-	c.retry.Clear(ctx, topic, xmsg.ID)
+	c.retry.Clear(ctx, topic, retryKey)
 }
 
-func (c *Consumer) handleFailure(ctx context.Context, topic, stream string, msg *mq.Message, handlerErr error) {
-	count, exhausted, err := c.retry.Attempt(ctx, topic, msg.ID)
+func (c *Consumer) handleFailure(ctx context.Context, topic, stream string, msg *mq.Message, retryKey string, handlerErr error) {
+	count, err := c.retry.GetCount(ctx, topic, retryKey)
 	if err != nil {
-		c.logger.Error("retry attempt failed", "topic", topic, "msg_id", msg.ID, "error", err)
+		c.logger.Error("get retry count failed", "topic", topic, "msg_id", msg.ID, "error", err)
+		// Don't ACK — leave it pending for recovery
 		return
 	}
 
-	if exhausted {
-		// Move to dead letter queue, then ACK
+	// Consumer does NOT increment — only recovery increments to avoid double-counting.
+	// But if count already reached max (set by recovery), push to DLQ immediately.
+	if count >= c.retry.MaxRetry() {
 		reason := fmt.Sprintf("max retries reached (%d): %v", count, handlerErr)
-		_ = c.dlq.Push(ctx, msg, reason)
+		if err := c.dlq.Push(ctx, msg, reason); err != nil {
+			c.logger.Error("dlq push failed, leaving pending", "topic", topic, "msg_id", msg.ID, "error", err)
+			return
+		}
 		c.ack(ctx, stream, msg.ID)
-		c.retry.Clear(ctx, topic, msg.ID)
+		c.retry.Clear(ctx, topic, retryKey)
 		return
 	}
 
-	// Backoff then let it be re-claimed by recovery or re-read
-	backoff := c.retry.BackoffDuration(count)
+	// Log warning, don't ACK — leave it pending for XAUTOCLAIM recovery
 	c.logger.Warn("message processing failed, will retry",
 		"topic", topic, "msg_id", msg.ID,
-		"attempt", count, "backoff", backoff,
+		"attempt", count,
 		"error", handlerErr)
-
-	// Sleep for backoff period (respecting context cancellation)
-	select {
-	case <-time.After(backoff):
-	case <-ctx.Done():
-	}
-	// Don't ACK — leave it pending for XAUTOCLAIM recovery
 }
 
 func (c *Consumer) ack(ctx context.Context, stream, id string) {

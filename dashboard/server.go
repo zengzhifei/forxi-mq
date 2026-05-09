@@ -32,7 +32,8 @@ func New(rdb *redis.Client, addr string, logger log.Logger) *Server {
 }
 
 // Start launches the HTTP server in a goroutine.
-func (s *Server) Start(ctx context.Context) {
+// The returned channel is closed when the server has fully stopped.
+func (s *Server) Start(ctx context.Context) <-chan struct{} {
 	mux := http.NewServeMux()
 
 	// API routes
@@ -62,6 +63,7 @@ func (s *Server) Start(ctx context.Context) {
 		Handler: mux,
 	}
 
+	done := make(chan struct{})
 	go func() {
 		s.logger.Info("dashboard started", "addr", s.addr)
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -72,5 +74,8 @@ func (s *Server) Start(ctx context.Context) {
 	go func() {
 		<-ctx.Done()
 		s.srv.Close()
+		close(done)
 	}()
+
+	return done
 }

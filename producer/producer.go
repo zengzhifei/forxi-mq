@@ -2,6 +2,8 @@ package producer
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"time"
 
@@ -49,15 +51,27 @@ func (p *Producer) Publish(ctx context.Context, msg *mq.Message) error {
 }
 
 // DelayPublish sends a message that will be delivered after the specified delay.
+// Uses ZSET (score=dueTime) + Hash (body storage) with a unique ID as member.
 func (p *Producer) DelayPublish(ctx context.Context, msg *mq.Message, delay time.Duration) error {
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
+	id := generateID()
 	score := float64(time.Now().Add(delay).UnixMilli())
-	return p.rdb.ZAdd(ctx, internal.DelayKey(msg.Topic), redis.Z{
-		Score:  score,
-		Member: string(body),
-	}).Err()
+	delayKey := internal.DelayKey(msg.Topic)
+	dataKey := internal.DelayDataKey(msg.Topic)
+
+	pipe := p.rdb.Pipeline()
+	pipe.ZAdd(ctx, delayKey, redis.Z{Score: score, Member: id})
+	pipe.HSet(ctx, dataKey, id, string(body))
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func generateID() string {
+	b := make([]byte, 12)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }

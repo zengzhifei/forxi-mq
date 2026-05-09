@@ -2,7 +2,6 @@ package retry
 
 import (
 	"context"
-	"math"
 	"strconv"
 	"time"
 
@@ -23,28 +22,6 @@ func New(rdb *redis.Client, maxRetry int, backoff time.Duration) *Strategy {
 	return &Strategy{rdb: rdb, maxRetry: maxRetry, backoff: backoff}
 }
 
-// Attempt increments the retry count and returns:
-// - count: current retry number (after increment)
-// - exhausted: true if max retries reached
-func (s *Strategy) Attempt(ctx context.Context, topic, msgID string) (count int, exhausted bool, err error) {
-	key := internal.RetryCountKey(topic, msgID)
-	val, err := s.rdb.Incr(ctx, key).Result()
-	if err != nil {
-		return 0, false, err
-	}
-	// Set TTL so retry keys don't linger forever
-	s.rdb.Expire(ctx, key, time.Hour)
-
-	count = int(val)
-	return count, count >= s.maxRetry, nil
-}
-
-// BackoffDuration returns the delay before the n-th retry (exponential backoff).
-func (s *Strategy) BackoffDuration(attempt int) time.Duration {
-	multiplier := math.Pow(2, float64(attempt-1))
-	return time.Duration(multiplier) * s.backoff
-}
-
 // Clear removes the retry counter for a message (on successful processing).
 func (s *Strategy) Clear(ctx context.Context, topic, msgID string) {
 	key := internal.RetryCountKey(topic, msgID)
@@ -62,6 +39,11 @@ func (s *Strategy) GetCount(ctx context.Context, topic, msgID string) (int, erro
 		return 0, err
 	}
 	return strconv.Atoi(val)
+}
+
+// MaxRetry returns the configured max retry count.
+func (s *Strategy) MaxRetry() int {
+	return s.maxRetry
 }
 
 // Increment bumps the retry counter by 1 (used by recovery).

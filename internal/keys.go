@@ -14,9 +14,14 @@ func DeadLetterKey(topic string) string {
 	return fmt.Sprintf("%s:dead:%s", prefix, topic)
 }
 
-// DelayKey returns the sorted set key for delay messages.
+// DelayKey returns the sorted set key for delay messages (stores ID → score).
 func DelayKey(topic string) string {
 	return fmt.Sprintf("%s:delay:%s", prefix, topic)
+}
+
+// DelayDataKey returns the hash key that stores delay message bodies (ID → body).
+func DelayDataKey(topic string) string {
+	return fmt.Sprintf("%s:delay:data:%s", prefix, topic)
 }
 
 // RetryCountKey returns the retry counter key for a specific message.

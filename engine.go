@@ -3,6 +3,7 @@ package fxmq
 import (
 	"context"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -52,6 +53,11 @@ func WithRetryBackoff(d time.Duration) Option {
 // WithAckTimeout sets the pending message timeout (default: 60s).
 func WithAckTimeout(d time.Duration) Option {
 	return func(e *Engine) { e.cfg.AckTimeout = d }
+}
+
+// WithRecoveryInterval sets how often recovery checks for pending messages (default: 15s).
+func WithRecoveryInterval(d time.Duration) Option {
+	return func(e *Engine) { e.cfg.RecoveryInterval = d }
 }
 
 // WithStreamMaxLen sets the stream MAXLEN~ trimming (default: 0 = unlimited).
@@ -116,6 +122,7 @@ type Engine struct {
 	alertCfg      *alert.Config
 	cancel        context.CancelFunc
 	topics        []string
+	bgWg          sync.WaitGroup
 }
 
 // NewEngine creates a new Engine.
@@ -195,23 +202,44 @@ func (e *Engine) Start(ctx context.Context) {
 	e.cancel = cancel
 
 	e.delayPoller = delay.New(e.rdb, e.topics, e.cfg.DelayPollInterval, e.cfg.StreamMaxLen, e.logger)
-	go e.delayPoller.Run(ctx)
+	e.bgWg.Add(1)
+	go func() {
+		defer e.bgWg.Done()
+		e.delayPoller.Run(ctx)
+	}()
 
 	e.recovery = recovery.New(e.rdb, e.cfg, e.topics, e.logger, e.Retry, e.DLQ)
-	go e.recovery.Run(ctx)
+	e.bgWg.Add(1)
+	go func() {
+		defer e.bgWg.Done()
+		e.recovery.Run(ctx)
+	}()
 
 	if e.cfg.Retention > 0 {
-		go e.runRetentionTrimmer(ctx)
+		e.bgWg.Add(1)
+		go func() {
+			defer e.bgWg.Done()
+			e.runRetentionTrimmer(ctx)
+		}()
 	}
 
 	if e.dashboardAddr != "" {
 		dash := dashboard.New(e.rdb, e.dashboardAddr, e.logger)
-		dash.Start(ctx)
+		dashDone := dash.Start(ctx)
+		e.bgWg.Add(1)
+		go func() {
+			defer e.bgWg.Done()
+			<-dashDone
+		}()
 	}
 
 	if e.alertCfg != nil {
 		alerter := alert.New(e.rdb, e.topics, *e.alertCfg, e.logger)
-		go alerter.Run(ctx)
+		e.bgWg.Add(1)
+		go func() {
+			defer e.bgWg.Done()
+			alerter.Run(ctx)
+		}()
 	}
 
 	e.logger.Info("engine started", "topics", e.topics)
@@ -257,6 +285,7 @@ func (e *Engine) Shutdown() {
 		e.cancel()
 	}
 	e.Consumer.Shutdown()
+	e.bgWg.Wait()
 	if e.ownsRdb {
 		e.rdb.Close()
 	}

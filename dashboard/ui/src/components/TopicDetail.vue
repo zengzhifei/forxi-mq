@@ -129,10 +129,8 @@ function nextPage(tab) {
     cursors.value.delay.push(delayOffset.value)
     fetchDelay(newOffset)
   } else {
-    const list = { messages, lag: lagMessages, pending: pendingMessages, dead: deadMessages }[tab]
-    if (list.value.length > 0) {
-      cursors.value[tab].push(list.value[0].id || '')
-    }
+    // Push the cursor used to navigate to the next page (for going back later)
+    cursors.value[tab].push(cursor)
     const fetcher = { messages: fetchMessages, lag: fetchLag, pending: fetchPending, dead: fetchDead }[tab]
     fetcher(cursor)
   }
@@ -144,10 +142,14 @@ function prevPage(tab) {
     const prevOffset = cursors.value.delay.pop()
     fetchDelay(prevOffset)
   } else {
+    // Pop the cursor that brought us to the current page
     cursors.value[tab].pop()
+    // Use the last remaining cursor (or '' for page 1)
+    const prevCursor = cursors.value[tab].length > 0
+      ? cursors.value[tab][cursors.value[tab].length - 1]
+      : ''
     const fetcher = { messages: fetchMessages, lag: fetchLag, pending: fetchPending, dead: fetchDead }[tab]
-    fetcher('')
-    cursors.value[tab] = []
+    fetcher(prevCursor)
   }
 }
 
@@ -249,7 +251,7 @@ async function deleteDelay(row) {
     const res = await fetch(`/api/topics/${props.topic}/delay/delete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ body: row.body })
+      body: JSON.stringify({ id: row.id })
     })
     const data = await res.json()
     if (data.ok) {
@@ -323,9 +325,15 @@ function exportMessages(tab) {
 async function requeue() {
   requeueLoading.value = true
   try {
-    const res = await fetch(`/api/topics/${props.topic}/dead/requeue`, { method: 'POST' })
-    const data = await res.json()
-    ElMessage.success(`Requeued ${data.requeued} messages`)
+    let total = 0
+    // Loop until all dead messages are requeued (API batches 200 per request)
+    while (true) {
+      const res = await fetch(`/api/topics/${props.topic}/dead/requeue`, { method: 'POST' })
+      const data = await res.json()
+      total += data.requeued || 0
+      if (!data.requeued || data.requeued === 0) break
+    }
+    ElMessage.success(`Requeued ${total} messages`)
     fetchAll()
   } catch (e) {
     ElMessage.error('Requeue failed')

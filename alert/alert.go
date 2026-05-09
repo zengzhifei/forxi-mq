@@ -149,7 +149,6 @@ func (a *Alerter) send(topic string, reasons []string) {
 
 	var payload []byte
 	var webhookURL string
-	var err error
 
 	switch a.cfg.Type {
 	case "feishu":
@@ -160,11 +159,6 @@ func (a *Alerter) send(topic string, reasons []string) {
 		payload, webhookURL = a.buildWeCom(text)
 	default:
 		payload, webhookURL = a.buildGeneric(text)
-	}
-
-	if err != nil {
-		a.logger.Error("alert build failed", "error", err)
-		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

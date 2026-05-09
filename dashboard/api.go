@@ -52,6 +52,7 @@ type deadMessage struct {
 }
 
 type delayMessage struct {
+	ID    string  `json:"id"`
 	Body  string  `json:"body"`
 	Score float64 `json:"score"`
 	DueAt string  `json:"due_at"`
@@ -183,7 +184,7 @@ func (s *Server) handleLag(w http.ResponseWriter, r *http.Request) {
 	// Get the earliest last-delivered-id (messages after this are "lag")
 	lastID := groups[0].LastDeliveredID
 	for _, g := range groups[1:] {
-		if g.LastDeliveredID < lastID {
+		if compareStreamID(g.LastDeliveredID, lastID) < 0 {
 			lastID = g.LastDeliveredID
 		}
 	}
@@ -335,8 +336,8 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	deadKey := internal.DeadLetterKey(topic)
 	streamKey := internal.StreamKey(topic)
 
-	// Read all dead messages and requeue them
-	msgs, err := s.rdb.XRange(ctx, deadKey, "-", "+").Result()
+	// Batch requeue dead messages (max 200 per request to avoid OOM)
+	msgs, err := s.rdb.XRangeN(ctx, deadKey, "-", "+", 200).Result()
 	if err != nil || len(msgs) == 0 {
 		writeJSON(w, map[string]int{"requeued": 0})
 		return
@@ -409,12 +410,18 @@ func (s *Server) handleDelayQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dataKey := internal.DelayDataKey(topic)
 	var msgs []delayMessage
 	for _, z := range results {
-		body, _ := z.Member.(string)
+		id, _ := z.Member.(string)
 		ts := int64(z.Score)
 		dueAt := time.UnixMilli(ts).Format(time.RFC3339)
+
+		// Get body from Hash
+		body, _ := s.rdb.HGet(ctx, dataKey, id).Result()
+
 		msgs = append(msgs, delayMessage{
+			ID:    id,
 			Body:  body,
 			Score: z.Score,
 			DueAt: dueAt,
@@ -513,14 +520,20 @@ func (s *Server) handleDeleteDelay(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var req struct {
-		Body string `json:"body"`
+		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
-		http.Error(w, "invalid body", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
 
-	err := s.rdb.ZRem(ctx, internal.DelayKey(topic), req.Body).Err()
+	delayKey := internal.DelayKey(topic)
+	dataKey := internal.DelayDataKey(topic)
+
+	pipe := s.rdb.Pipeline()
+	pipe.ZRem(ctx, delayKey, req.ID)
+	pipe.HDel(ctx, dataKey, req.ID)
+	_, err := pipe.Exec(ctx)
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -590,6 +603,9 @@ func extractTopic(key string) string {
 	if strings.HasPrefix(parts, "dead:") {
 		return strings.TrimPrefix(parts, "dead:")
 	}
+	if strings.HasPrefix(parts, "delay:data:") {
+		return strings.TrimPrefix(parts, "delay:data:")
+	}
 	if strings.HasPrefix(parts, "delay:") {
 		return strings.TrimPrefix(parts, "delay:")
 	}
@@ -600,6 +616,39 @@ func extractTopic(key string) string {
 
 	// Direct stream key: fxmq:{topic}
 	return parts
+}
+
+// compareStreamID compares two Redis stream IDs numerically.
+// Returns -1 if a < b, 0 if a == b, 1 if a > b.
+func compareStreamID(a, b string) int {
+	aParts := strings.SplitN(a, "-", 2)
+	bParts := strings.SplitN(b, "-", 2)
+
+	aMs, _ := strconv.ParseInt(aParts[0], 10, 64)
+	bMs, _ := strconv.ParseInt(bParts[0], 10, 64)
+
+	if aMs != bMs {
+		if aMs < bMs {
+			return -1
+		}
+		return 1
+	}
+
+	var aSeq, bSeq int64
+	if len(aParts) > 1 {
+		aSeq, _ = strconv.ParseInt(aParts[1], 10, 64)
+	}
+	if len(bParts) > 1 {
+		bSeq, _ = strconv.ParseInt(bParts[1], 10, 64)
+	}
+
+	if aSeq < bSeq {
+		return -1
+	}
+	if aSeq > bSeq {
+		return 1
+	}
+	return 0
 }
 
 func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
