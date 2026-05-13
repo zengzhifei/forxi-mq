@@ -326,6 +326,30 @@ async function deleteDelay(row) {
   }
 }
 
+// --- Destroy Group ---
+
+async function destroyGroup(group) {
+  try {
+    await ElMessageBox.confirm(
+      `确认销毁消费组 "${group.name}"？\n销毁后该组的消费位点、Pending 消息等数据将永久丢失。`,
+      '销毁确认',
+      { type: 'warning', confirmButtonText: '确认销毁', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch { return }
+  try {
+    const res = await fetch(`/api/topics/${props.topic}/groups/${group.name}`, { method: 'DELETE' })
+    const data = await res.json()
+    if (data.ok) {
+      ElMessage.success(`消费组 "${group.name}" 已销毁`)
+      fetchDetail()
+    } else {
+      ElMessage.error(data.error || '销毁失败')
+    }
+  } catch (e) {
+    ElMessage.error('销毁失败')
+  }
+}
+
 // --- Reset Group ---
 
 async function resetGroup(group, mode) {
@@ -624,6 +648,9 @@ onUnmounted(() => clearInterval(timer))
                 <el-button size="small" :icon="Position" @click="resetGroup(group, 'start')" title="重置到起始点（从头消费）">重置到起始</el-button>
                 <el-button size="small" @click="resetGroup(group, 'latest')" title="重置到最新点（跳过历史）">重置到最新</el-button>
               </template>
+              <el-button v-if="group.name !== selfGroup" size="small" :icon="Delete" type="danger" plain @click="destroyGroup(group)" title="销毁该消费组">
+                销毁
+              </el-button>
             </div>
             <div class="group-meta">
               <span class="meta-label">消费位点:</span>

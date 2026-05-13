@@ -55,6 +55,7 @@ func (s *Server) Start(ctx context.Context) <-chan struct{} {
 	mux.HandleFunc("DELETE /api/topics/{topic}/dead/{id}", s.handleDeleteDead)
 	mux.HandleFunc("POST /api/topics/{topic}/delay/delete", s.handleDeleteDelay)
 	mux.HandleFunc("POST /api/topics/{topic}/groups/{group}/reset", s.handleResetGroup)
+	mux.HandleFunc("DELETE /api/topics/{topic}/groups/{group}", s.handleDestroyGroup)
 	mux.HandleFunc("DELETE /api/topics/{topic}", s.handleDeleteTopic)
 
 	// Static files (Vue dist)

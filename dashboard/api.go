@@ -731,6 +731,20 @@ func (s *Server) handleResetGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
+func (s *Server) handleDestroyGroup(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	group := r.PathValue("group")
+	ctx := r.Context()
+
+	streamKey := internal.StreamKey(topic)
+	err := s.rdb.XGroupDestroy(ctx, streamKey, group).Err()
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
