@@ -36,8 +36,14 @@ release: frontend build vet
 	@echo "==> Releasing $(VERSION)"
 	git add .
 	git commit -m "release: $(VERSION)"
+	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
+		echo "==> Tag $(VERSION) exists, replacing..."; \
+		git tag -d "$(VERSION)"; \
+		git push origin ":refs/tags/$(VERSION)" 2>/dev/null || true; \
+	fi
 	git tag $(VERSION)
-	git push origin main --tags
+	git push origin main
+	git push origin $(VERSION)
 	@echo "==> Released $(VERSION)"
 
 ## clean: Remove build artifacts
