@@ -798,7 +798,7 @@ onUnmounted(() => clearInterval(timer))
         <el-table :data="deadMessages" stripe max-height="420" size="small">
           <el-table-column type="expand">
             <template #default="{ row }">
-              <pre class="msg-expand">{{ row.body }}</pre>
+              <pre class="msg-expand">{{ formatBody(row) }}</pre>
             </template>
           </el-table-column>
           <el-table-column label="ID" width="190">
@@ -809,12 +809,12 @@ onUnmounted(() => clearInterval(timer))
           <el-table-column prop="reason" label="Reason" width="180" show-overflow-tooltip />
           <el-table-column label="Body">
             <template #default="{ row }">
-              <span class="body-preview">{{ row.body }}</span>
+              <span class="body-preview">{{ formatBody(row) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="" width="110" align="center">
             <template #default="{ row }">
-              <el-button :icon="CopyDocument" size="small" circle class="copy-btn" title="复制消息体" @click.stop="copyText(row.body || '')" />
+              <el-button :icon="CopyDocument" size="small" circle class="copy-btn" title="复制消息体" @click.stop="copyText(formatBody(row))" />
               <el-button :icon="RefreshRight" size="small" circle class="copy-btn" title="重新投递" @click.stop="resendMsg(row)" />
               <el-button :icon="Delete" size="small" circle class="copy-btn del-btn" title="删除该消息" @click.stop="deleteDead(row)" />
             </template>
@@ -838,7 +838,7 @@ onUnmounted(() => clearInterval(timer))
         <el-table :data="delayMessages" stripe max-height="420" size="small">
           <el-table-column type="expand">
             <template #default="{ row }">
-              <pre class="msg-expand">{{ row.body }}</pre>
+              <pre class="msg-expand">{{ formatBody(row) }}</pre>
             </template>
           </el-table-column>
           <el-table-column label="Delay ID" width="220">
@@ -849,12 +849,12 @@ onUnmounted(() => clearInterval(timer))
           <el-table-column prop="due_at" label="Due At" width="200" />
           <el-table-column label="Body">
             <template #default="{ row }">
-              <span class="body-preview">{{ row.body }}</span>
+              <span class="body-preview">{{ formatBody(row) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="" width="110" align="center">
             <template #default="{ row }">
-              <el-button :icon="CopyDocument" size="small" circle class="copy-btn" title="复制消息体" @click.stop="copyText(row.body || '')" />
+              <el-button :icon="CopyDocument" size="small" circle class="copy-btn" title="复制消息体" @click.stop="copyText(formatBody(row))" />
               <el-button :icon="RefreshRight" size="small" circle class="copy-btn" title="重新投递" @click.stop="resendMsg(row)" />
               <el-button :icon="Delete" size="small" circle class="copy-btn del-btn" title="删除该消息" @click.stop="deleteDelay(row)" />
             </template>

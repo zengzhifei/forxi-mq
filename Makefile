@@ -1,42 +1,44 @@
-VERSION ?= $(shell git describe --tags --always --dirty)
+# Auto-increment patch version from latest tag
+AUTO_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' | awk -F. '{printf "v%s.%s.%d", $$1, $$2, $$3+1}' || echo "v0.0.1")
 
-.PHONY: build test vet frontend release clean
+# Capture positional argument (the word after the target)
+ARG := $(filter-out push release clean help build vet test frontend,$(MAKECMDGOALS))
+VERSION = $(or $(ARG),$(AUTO_VERSION))
+MSG = $(ARG)
 
-## build: Build all Go packages
+# Catch-all to prevent "No rule to make target" for positional args
+%::
+	@true
+
+.PHONY: build test vet frontend push release clean help
+
 build: frontend
 	go build ./...
 
-## vet: Run go vet
 vet:
 	go vet ./...
 
-## test: Run tests
 test:
 	go test ./...
 
-## frontend: Build dashboard frontend
 frontend:
 	cd dashboard/ui && npm install && npm run build
 
-## release: Build, verify, and tag a release (usage: make release VERSION=v0.1.0)
-release: frontend build vet
-	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=v0.1.0"; exit 1; fi
-	@echo ""
-	@echo "==> Ready to release $(VERSION)"
-	@echo ""
-	git add .
-	git status
-	@echo ""
-	@read -p "Commit and tag $(VERSION)? [y/N] " confirm; \
-	if [ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ]; then \
-		git commit -m "release: $(VERSION)"; \
-		git tag $(VERSION); \
-		echo "Tagged $(VERSION). Run 'make push' to publish."; \
-	fi
-
-## push: Push commits and tags to origin
+## push: Commit and push code (usage: make push 'message')
 push:
+	@if [ -z "$(MSG)" ]; then echo "Usage: make push 'commit message'"; exit 1; fi
+	git add .
+	git commit -m "$(MSG)"
+	git push origin main
+
+## release: Build, bump version, tag, push (usage: make release [version])
+release: frontend build vet
+	@echo "==> Releasing $(VERSION)"
+	git add .
+	git commit -m "release: $(VERSION)"
+	git tag $(VERSION)
 	git push origin main --tags
+	@echo "==> Released $(VERSION)"
 
 ## clean: Remove build artifacts
 clean:
