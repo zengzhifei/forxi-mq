@@ -2,8 +2,6 @@ package producer
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"time"
 
@@ -42,7 +40,14 @@ func (p *Producer) Publish(ctx context.Context, msg *mq.Message) error {
 		args.Approx = true
 	}
 
-	id, err := p.rdb.XAdd(ctx, args).Result()
+	pipe := p.rdb.Pipeline()
+	pipe.XAdd(ctx, args)
+	pipe.SAdd(ctx, internal.TopicsSetKey(), msg.Topic)
+	cmds, err := pipe.Exec(ctx)
+	if err != nil {
+		return err
+	}
+	id, err := cmds[0].(*redis.StringCmd).Result()
 	if err != nil {
 		return err
 	}
@@ -58,7 +63,7 @@ func (p *Producer) DelayPublish(ctx context.Context, msg *mq.Message, delay time
 		return err
 	}
 
-	id := generateID()
+	id := internal.GenerateID()
 	score := float64(time.Now().Add(delay).UnixMilli())
 	delayKey := internal.DelayKey(msg.Topic)
 	dataKey := internal.DelayDataKey(msg.Topic)
@@ -66,6 +71,7 @@ func (p *Producer) DelayPublish(ctx context.Context, msg *mq.Message, delay time
 	pipe := p.rdb.Pipeline()
 	pipe.ZAdd(ctx, delayKey, redis.Z{Score: score, Member: id})
 	pipe.HSet(ctx, dataKey, id, string(body))
+	pipe.SAdd(ctx, internal.TopicsSetKey(), msg.Topic)
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return err
@@ -74,8 +80,3 @@ func (p *Producer) DelayPublish(ctx context.Context, msg *mq.Message, delay time
 	return nil
 }
 
-func generateID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}

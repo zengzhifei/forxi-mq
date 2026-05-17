@@ -193,7 +193,6 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
     fxmq.WithRedisPassword("secret"),           // Redis 密码
     fxmq.WithRedisDB(1),                        // Redis DB
     fxmq.WithLogger(customLogger),              // 自定义日志
-    fxmq.WithRedisClient(existingClient),       // 复用 Redis 连接
 )
 ```
 

@@ -2,8 +2,6 @@ package dashboard
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -74,13 +72,27 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	topics := s.discoverTopics(ctx)
 	resp := overviewResp{Topics: len(topics)}
 
-	for _, topic := range topics {
-		length, _ := s.rdb.XLen(ctx, internal.StreamKey(topic)).Result()
-		dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic, s.group)).Result()
-		delay, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
-		resp.TotalMsgs += length
-		resp.TotalDead += dead
-		resp.TotalDelay += delay
+	// Batch all stats calls into one pipeline round trip
+	pipe := s.rdb.Pipeline()
+	type cmd struct {
+		len  *redis.IntCmd
+		dead *redis.IntCmd
+		z    *redis.IntCmd
+	}
+	cmds := make([]cmd, len(topics))
+	for i, topic := range topics {
+		cmds[i] = cmd{
+			len:  pipe.XLen(ctx, internal.StreamKey(topic)),
+			dead: pipe.XLen(ctx, internal.DeadLetterKey(topic, s.group)),
+			z:    pipe.ZCard(ctx, internal.DelayKey(topic)),
+		}
+	}
+	pipe.Exec(ctx)
+
+	for _, c := range cmds {
+		resp.TotalMsgs += c.len.Val()
+		resp.TotalDead += c.dead.Val()
+		resp.TotalDelay += c.z.Val()
 	}
 
 	writeJSON(w, resp)
@@ -89,10 +101,15 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	discovered := s.discoverTopics(ctx)
-	var topics []topicInfo
+	topics := make([]topicInfo, 0)
 
 	for _, topic := range discovered {
-		info := s.getTopicInfo(ctx, topic)
+		info := s.getTopicStats(ctx, topic)
+		groups, _ := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
+		for _, g := range groups {
+			info.Lag += g.Lag
+			info.Pending += g.Pending
+		}
 		topics = append(topics, info)
 	}
 
@@ -102,20 +119,27 @@ func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
-	info := s.getTopicInfo(ctx, topic)
+	streamKey := internal.StreamKey(topic)
+
+	info := s.getTopicStats(ctx, topic)
 	info.SelfGroup = s.group
 
-	// Get all groups and their consumers
-	groups, err := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
+	// Get groups info once and use for both stats and group details
+	groups, err := s.rdb.XInfoGroups(ctx, streamKey).Result()
 	if err == nil {
 		for _, g := range groups {
+			if g.Name == s.group {
+				info.Lag = g.Lag
+				info.Pending = g.Pending
+			}
+
 			gi := groupInfo{
 				Name:          g.Name,
 				Pending:       g.Pending,
 				Lag:           g.Lag,
 				LastDelivered: g.LastDeliveredID,
 			}
-			consumers, err := s.rdb.XInfoConsumers(ctx, internal.StreamKey(topic), g.Name).Result()
+			consumers, err := s.rdb.XInfoConsumers(ctx, streamKey, g.Name).Result()
 			if err == nil {
 				for _, c := range consumers {
 					gi.Consumers = append(gi.Consumers, consumerInfo{
@@ -126,11 +150,6 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			info.Groups = append(info.Groups, gi)
-			// Override top-level stats with self group's values
-			if g.Name == s.group {
-				info.Lag = g.Lag
-				info.Pending = g.Pending
-			}
 		}
 	}
 
@@ -168,7 +187,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result []map[string]any
+	result := make([]map[string]any, 0)
 	for _, msg := range msgs {
 		item := map[string]any{
 			"id":     msg.ID,
@@ -221,7 +240,7 @@ func (s *Server) handleLag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result []map[string]any
+	result := make([]map[string]any, 0)
 	for _, msg := range msgs {
 		item := map[string]any{
 			"id":     msg.ID,
@@ -257,7 +276,6 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Only query self group's pending messages
-	var result []map[string]any
 	pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: streamKey,
 		Group:  s.group,
@@ -270,24 +288,36 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch message bodies
-	for _, p := range pending {
-		msgs, err := s.rdb.XRangeN(ctx, streamKey, p.ID, p.ID, 1).Result()
+	// Pipeline body fetches and retry counts in one batch
+	pipe := s.rdb.Pipeline()
+	type pendingCmd struct {
+		xrange *redis.XMessageSliceCmd
+		retry  *redis.StringCmd
+	}
+	cmds := make([]pendingCmd, len(pending))
+	for i, p := range pending {
+		cmds[i] = pendingCmd{
+			xrange: pipe.XRangeN(ctx, streamKey, p.ID, p.ID, 1),
+			retry:  pipe.Get(ctx, internal.RetryCountKey(topic, s.group, p.ID)),
+		}
+	}
+	pipe.Exec(ctx)
+
+	result := make([]map[string]any, 0)
+	for i, p := range pending {
+		msgs, err := cmds[i].xrange.Result()
 		if err != nil || len(msgs) == 0 {
 			continue
 		}
+		retryCount, _ := cmds[i].retry.Int()
 
-		// Get real retry count from forxi-mq retry counter
-		retryCount, _ := s.rdb.Get(ctx, internal.RetryCountKey(topic, s.group, p.ID)).Int()
-
-		item := map[string]any{
+		result = append(result, map[string]any{
 			"id":          p.ID,
 			"consumer":    p.Consumer,
 			"idle":        p.Idle.String(),
 			"retry_count": retryCount,
 			"values":      filterValues(msgs[0].Values),
-		}
-		result = append(result, item)
+		})
 	}
 
 	var nextCursor string
@@ -320,7 +350,7 @@ func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result []deadMessage
+	result := make([]deadMessage, 0)
 	for _, msg := range msgs {
 		dm := deadMessage{ID: msg.ID}
 		if body, ok := msg.Values["body"].(string); ok {
@@ -381,6 +411,12 @@ func (s *Server) handleResend(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 
+	exists, _ := s.rdb.SIsMember(ctx, internal.TopicsSetKey(), topic).Result()
+	if !exists {
+		writeJSON(w, map[string]any{"ok": false, "error": "topic does not exist"})
+		return
+	}
+
 	var req struct {
 		Body string `json:"body"`
 	}
@@ -426,7 +462,7 @@ func (s *Server) handleDelayQueue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dataKey := internal.DelayDataKey(topic)
-	var msgs []delayMessage
+	msgs := make([]delayMessage, 0)
 	for _, z := range results {
 		id, _ := z.Member.(string)
 		ts := int64(z.Score)
@@ -604,6 +640,13 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	ctx := r.Context()
 
+	// Topic must exist before publishing
+	exists, _ := s.rdb.SIsMember(ctx, internal.TopicsSetKey(), topic).Result()
+	if !exists {
+		writeJSON(w, map[string]any{"ok": false, "error": "topic does not exist"})
+		return
+	}
+
 	var req struct {
 		Payload  json.RawMessage   `json:"payload"`
 		Metadata map[string]string `json:"metadata,omitempty"`
@@ -635,7 +678,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		id := generateDelayID()
+		id := internal.GenerateID()
 		score := float64(req.DueAt)
 		delayKey := internal.DelayKey(topic)
 		dataKey := internal.DelayDataKey(topic)
@@ -777,6 +820,7 @@ func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
 
 	// All empty — safe to delete keys
 	s.rdb.Del(ctx, streamKey, dlqKey, delayKey, delayDataKey)
+	s.rdb.SRem(ctx, internal.TopicsSetKey(), topic)
 
 	writeJSON(w, map[string]any{"ok": true})
 }
@@ -798,63 +842,13 @@ func (s *Server) getGroupLastDeliveredID(ctx context.Context, streamKey string) 
 	return ""
 }
 
-// discoverTopics scans Redis for all fxmq:* keys and extracts topic names.
+// discoverTopics reads the topic set to get all known topic names.
 func (s *Server) discoverTopics(ctx context.Context) []string {
-	seen := make(map[string]bool)
-
-	var cursor uint64
-	for {
-		keys, next, err := s.rdb.Scan(ctx, cursor, "fxmq:*", 100).Result()
-		if err != nil {
-			break
-		}
-		for _, key := range keys {
-			topic := extractTopic(key)
-			if topic != "" && !seen[topic] {
-				seen[topic] = true
-			}
-		}
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-
-	topics := make([]string, 0, len(seen))
-	for t := range seen {
-		topics = append(topics, t)
+	topics, err := s.rdb.SMembers(ctx, internal.TopicsSetKey()).Result()
+	if err != nil {
+		return nil
 	}
 	return topics
-}
-
-// extractTopic extracts the topic name from a Redis key.
-// fxmq:{topic}         → {topic}
-// fxmq:dead:{topic}    → {topic}
-// fxmq:delay:{topic}   → {topic}
-// fxmq:retry:{topic}:* → (ignored, too granular)
-func extractTopic(key string) string {
-	parts := strings.TrimPrefix(key, "fxmq:")
-
-	if strings.HasPrefix(parts, "dead:") {
-		return strings.TrimPrefix(parts, "dead:")
-	}
-	if strings.HasPrefix(parts, "delay-map:") {
-		// delay-map keys are fxmq:delay-map:{topic}:{delayID}, skip them
-		return ""
-	}
-	if strings.HasPrefix(parts, "delay:data:") {
-		return strings.TrimPrefix(parts, "delay:data:")
-	}
-	if strings.HasPrefix(parts, "delay:") {
-		return strings.TrimPrefix(parts, "delay:")
-	}
-	if strings.HasPrefix(parts, "retry:") {
-		// retry keys are fxmq:retry:{topic}:{msgID}, skip them
-		return ""
-	}
-
-	// Direct stream key: fxmq:{topic}
-	return parts
 }
 
 // compareStreamID compares two Redis stream IDs numerically.
@@ -890,28 +884,22 @@ func compareStreamID(a, b string) int {
 	return 0
 }
 
-func (s *Server) getTopicInfo(ctx context.Context, topic string) topicInfo {
-	length, _ := s.rdb.XLen(ctx, internal.StreamKey(topic)).Result()
-	dead, _ := s.rdb.XLen(ctx, internal.DeadLetterKey(topic, s.group)).Result()
-	delayCount, _ := s.rdb.ZCard(ctx, internal.DelayKey(topic)).Result()
+func (s *Server) getTopicStats(ctx context.Context, topic string) topicInfo {
+	streamKey := internal.StreamKey(topic)
+	deadKey := internal.DeadLetterKey(topic, s.group)
+	delayKey := internal.DelayKey(topic)
 
-	// Sum pending and lag across all groups
-	var pending, lag int64
-	groups, err := s.rdb.XInfoGroups(ctx, internal.StreamKey(topic)).Result()
-	if err == nil {
-		for _, g := range groups {
-			pending += g.Pending
-			lag += g.Lag
-		}
-	}
+	pipe := s.rdb.Pipeline()
+	lenCmd := pipe.XLen(ctx, streamKey)
+	deadCmd := pipe.XLen(ctx, deadKey)
+	delayCmd := pipe.ZCard(ctx, delayKey)
+	pipe.Exec(ctx)
 
 	return topicInfo{
-		Name:    topic,
-		Stored:  length,
-		Lag:     lag,
-		Pending: pending,
-		Dead:    dead,
-		Delay:   delayCount,
+		Name:  topic,
+		Stored: lenCmd.Val(),
+		Dead:  deadCmd.Val(),
+		Delay: delayCmd.Val(),
 	}
 }
 
@@ -925,12 +913,6 @@ func filterValues(values map[string]interface{}) map[string]interface{} {
 		filtered[k] = v
 	}
 	return filtered
-}
-
-func generateDelayID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 func writeJSON(w http.ResponseWriter, data interface{}) {

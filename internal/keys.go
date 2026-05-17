@@ -33,3 +33,8 @@ func DelayMapKey(topic, delayID string) string {
 func RetryCountKey(topic, group, msgID string) string {
 	return fmt.Sprintf("%s:retry:%s:%s:%s", prefix, topic, group, msgID)
 }
+
+// TopicsSetKey returns the key for the set that tracks all known topic names.
+func TopicsSetKey() string {
+	return fmt.Sprintf("%s:topics", prefix)
+}

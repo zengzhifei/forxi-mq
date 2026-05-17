@@ -544,7 +544,7 @@ function statusLabel(status) {
 
 fetchConfig()
 watch(() => props.topic, () => { fetchAll() }, { immediate: true })
-timer = setInterval(fetchDetail, 3000)
+timer = setInterval(fetchDetail, 5000)
 onUnmounted(() => clearInterval(timer))
 </script>
 

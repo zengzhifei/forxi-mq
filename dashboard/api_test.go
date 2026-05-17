@@ -27,22 +27,3 @@ func TestCompareStreamID(t *testing.T) {
 	}
 }
 
-func TestExtractTopic(t *testing.T) {
-	tests := []struct {
-		key  string
-		want string
-	}{
-		{"fxmq:orders", "orders"},
-		{"fxmq:dead:orders", "orders"},
-		{"fxmq:delay:orders", "orders"},
-		{"fxmq:delay:data:orders", "orders"},
-		{"fxmq:retry:orders:12345", ""},
-	}
-
-	for _, tt := range tests {
-		got := extractTopic(tt.key)
-		if got != tt.want {
-			t.Errorf("extractTopic(%q) = %q, want %q", tt.key, got, tt.want)
-		}
-	}
-}

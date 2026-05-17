@@ -69,6 +69,9 @@ func (c *Consumer) Subscribe(ctx context.Context, topic string, handler Handler)
 		return fmt.Errorf("create consumer group: %w", err)
 	}
 
+	// Register topic — XGroupCreateMkStream creates the stream if new
+	c.rdb.SAdd(ctx, internal.TopicsSetKey(), topic)
+
 	subCtx, cancel := context.WithCancel(ctx)
 	c.mu.Lock()
 	c.cancels = append(c.cancels, cancel)

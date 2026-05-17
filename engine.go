@@ -3,6 +3,7 @@ package fxmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
@@ -82,14 +83,6 @@ func WithLogger(l log.Logger) Option {
 	return func(e *Engine) { e.logger = l }
 }
 
-// WithRedisClient sets a pre-existing Redis client (skips internal creation).
-func WithRedisClient(rdb *redis.Client) Option {
-	return func(e *Engine) {
-		e.rdb = rdb
-		e.ownsRdb = false
-	}
-}
-
 // WithDashboard enables the web dashboard on the given address (e.g. ":9090").
 func WithDashboard(addr string) Option {
 	return func(e *Engine) { e.dashboardAddr = addr }
@@ -102,10 +95,9 @@ func WithAlert(cfg alert.Config) Option {
 
 // Engine is the top-level entry point that wires all components together.
 type Engine struct {
-	rdb     *redis.Client
-	ownsRdb bool
-	cfg     Config
-	logger  log.Logger
+	rdb   *redis.Client
+	cfg   Config
+	logger log.Logger
 
 	Producer *producer.Producer
 	Consumer *consumer.Consumer
@@ -115,9 +107,11 @@ type Engine struct {
 	delayPoller   *delay.Poller
 	recovery      *recovery.Recovery
 	dashboardAddr string
+	dashRdb       *redis.Client
 	alertCfg      *alert.Config
 	cancel        context.CancelFunc
 	topics        []string
+	pendingSubs   []pendingSub
 	bgWg          sync.WaitGroup
 }
 
@@ -134,7 +128,6 @@ func NewEngine(redisAddr, group string, opts ...Option) (*Engine, error) {
 			RedisAddr: redisAddr,
 			Group:     group,
 		},
-		ownsRdb: true,
 	}
 
 	for _, opt := range opts {
@@ -148,23 +141,64 @@ func NewEngine(redisAddr, group string, opts ...Option) (*Engine, error) {
 		return nil, err
 	}
 
-	// Create Redis client if not provided externally
-	if e.rdb == nil {
-		e.rdb = redis.NewClient(&redis.Options{
-			Addr:     e.cfg.RedisAddr,
-			Password: e.cfg.RedisPassword,
-			DB:       e.cfg.RedisDB,
-		})
-	}
-
 	// Default logger
 	if e.logger == nil {
 		e.logger = log.New()
 	}
 
+	return e, nil
+}
+
+// Publish sends a message to the given topic.
+func (e *Engine) Publish(ctx context.Context, msg *Message) error {
+	if e.Producer == nil {
+		return errors.New("fxmq: engine not started, call Start() before Publish()")
+	}
+	return e.Producer.Publish(ctx, msg)
+}
+
+// DelayPublish sends a message that will be delivered after the specified delay.
+func (e *Engine) DelayPublish(ctx context.Context, msg *Message, d time.Duration) error {
+	if e.Producer == nil {
+		return errors.New("fxmq: engine not started, call Start() before DelayPublish()")
+	}
+	return e.Producer.DelayPublish(ctx, msg, d)
+}
+
+// pendingSub holds a subscription registered before Start.
+type pendingSub struct {
+	topic   string
+	handler Handler
+}
+
+// Subscribe registers a handler for a topic and starts consuming.
+func (e *Engine) Subscribe(ctx context.Context, topic string, handler Handler) error {
+	e.topics = append(e.topics, topic)
+	if e.Consumer != nil {
+		return e.Consumer.Subscribe(ctx, topic, handler)
+	}
+	e.pendingSubs = append(e.pendingSubs, pendingSub{topic, handler})
+	return nil
+}
+
+// initComponents creates the Redis client and all core components.
+// Called from Start() when the topic list is known.
+func (e *Engine) initComponents() {
+	// Create Redis client with pool sized for the known topics
+	poolSize := len(e.topics)*e.cfg.Concurrency + 15
+	if poolSize < 30 {
+		poolSize = 30
+	}
+	e.rdb = redis.NewClient(&redis.Options{
+		Addr:     e.cfg.RedisAddr,
+		Password: e.cfg.RedisPassword,
+		DB:       e.cfg.RedisDB,
+		PoolSize: poolSize,
+	})
+
 	retryTTL := e.cfg.Retention
 	if retryTTL <= 0 {
-		retryTTL = 7 * 24 * time.Hour // default 7 days
+		retryTTL = 7 * 24 * time.Hour
 	}
 	rs := retry.New(e.rdb, e.cfg.Group, retryTTL)
 	dlq := deadletter.New(e.rdb, e.cfg.Group, e.logger)
@@ -175,24 +209,6 @@ func NewEngine(redisAddr, group string, opts ...Option) (*Engine, error) {
 	e.Consumer = c
 	e.DLQ = dlq
 	e.Retry = rs
-
-	return e, nil
-}
-
-// Publish sends a message to the given topic.
-func (e *Engine) Publish(ctx context.Context, msg *Message) error {
-	return e.Producer.Publish(ctx, msg)
-}
-
-// DelayPublish sends a message that will be delivered after the specified delay.
-func (e *Engine) DelayPublish(ctx context.Context, msg *Message, d time.Duration) error {
-	return e.Producer.DelayPublish(ctx, msg, d)
-}
-
-// Subscribe registers a handler for a topic and starts consuming.
-func (e *Engine) Subscribe(ctx context.Context, topic string, handler Handler) error {
-	e.topics = append(e.topics, topic)
-	return e.Consumer.Subscribe(ctx, topic, handler)
 }
 
 // Start launches background goroutines (delay poller, pending recovery, retention trimmer).
@@ -200,6 +216,17 @@ func (e *Engine) Subscribe(ctx context.Context, topic string, handler Handler) e
 func (e *Engine) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
+
+	// Create Redis client and all components (pool size calculated from actual topic count)
+	e.initComponents()
+
+	// Apply subscriptions registered before Start
+	for _, sub := range e.pendingSubs {
+		if err := e.Consumer.Subscribe(ctx, sub.topic, sub.handler); err != nil {
+			e.logger.Error("failed to apply pending subscription", "topic", sub.topic, "error", err)
+		}
+	}
+	e.pendingSubs = nil
 
 	mapTTL := e.cfg.Retention
 	if mapTTL <= 0 {
@@ -227,7 +254,13 @@ func (e *Engine) Start(ctx context.Context) {
 	}()
 
 	if e.dashboardAddr != "" {
-		dash := dashboard.New(e.rdb, e.dashboardAddr, e.cfg.Group, e.logger)
+		e.dashRdb = redis.NewClient(&redis.Options{
+			Addr:     e.cfg.RedisAddr,
+			Password: e.cfg.RedisPassword,
+			DB:       e.cfg.RedisDB,
+			PoolSize: 8,
+		})
+		dash := dashboard.New(e.dashRdb, e.dashboardAddr, e.cfg.Group, e.logger)
 		dashDone := dash.Start(ctx)
 		e.bgWg.Add(1)
 		go func() {
@@ -326,9 +359,14 @@ func (e *Engine) Shutdown() {
 	if e.cancel != nil {
 		e.cancel()
 	}
-	e.Consumer.Shutdown()
+	if e.Consumer != nil {
+		e.Consumer.Shutdown()
+	}
 	e.bgWg.Wait()
-	if e.ownsRdb {
+	if e.dashRdb != nil {
+		e.dashRdb.Close()
+	}
+	if e.rdb != nil {
 		e.rdb.Close()
 	}
 	e.logger.Info("engine shutdown complete")

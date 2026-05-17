@@ -50,7 +50,7 @@ function closeTopic() {
 onMounted(() => {
   initTheme()
   fetchData()
-  timer = setInterval(fetchData, 3000)
+  timer = setInterval(fetchData, 5000)
 })
 
 onUnmounted(() => {
@@ -97,10 +97,10 @@ onUnmounted(() => {
           <el-col :span="6">
             <el-card shadow="never">
               <div class="stat-card">
-                <el-icon :size="28" color="#e6a23c"><Timer /></el-icon>
+                <el-icon :size="28" color="#f56c6c"><Warning /></el-icon>
                 <div class="stat-info">
-                  <div class="stat-value">{{ overview.total_delay }}</div>
-                  <div class="stat-label">Delayed</div>
+                  <div class="stat-value">{{ overview.total_dead }}</div>
+                  <div class="stat-label">Dead Letters</div>
                 </div>
               </div>
             </el-card>
@@ -108,10 +108,10 @@ onUnmounted(() => {
           <el-col :span="6">
             <el-card shadow="never">
               <div class="stat-card">
-                <el-icon :size="28" color="#f56c6c"><Warning /></el-icon>
+                <el-icon :size="28" color="#e6a23c"><Timer /></el-icon>
                 <div class="stat-info">
-                  <div class="stat-value">{{ overview.total_dead }}</div>
-                  <div class="stat-label">Dead Letters</div>
+                  <div class="stat-value">{{ overview.total_delay }}</div>
+                  <div class="stat-label">Delayed</div>
                 </div>
               </div>
             </el-card>
