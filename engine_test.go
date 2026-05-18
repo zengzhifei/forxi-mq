@@ -33,6 +33,11 @@ func cleanupKeys(rdb *redis.Client, topic string) {
 	if len(mapKeys) > 0 {
 		rdb.Del(ctx, mapKeys...)
 	}
+	// Clean lock keys
+	lockKeys, _ := rdb.Keys(ctx, "fxmq:lock:"+topic+":*").Result()
+	if len(lockKeys) > 0 {
+		rdb.Del(ctx, lockKeys...)
+	}
 }
 
 func newTestEngine(t *testing.T, opts ...fxmq.Option) *fxmq.Engine {
@@ -538,4 +543,192 @@ func TestDLQPushFailureNoAck(t *testing.T) {
 	// We verify the code path indirectly: if DLQ push returns error,
 	// handleFailure returns before ACK (code inspection confirmed).
 	t.Skip("requires DLQ failure injection - verified via code review")
+}
+
+// TestLockPreventsConcurrentProcessing verifies that the Redis lock prevents
+// the recovery/retry path from concurrently processing a message whose handler
+// is still running (exceeded AckTimeout but hasn't returned yet).
+func TestLockPreventsConcurrentProcessing(t *testing.T) {
+	topic := "test-lock-prevent"
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	defer rdb.Close()
+	cleanupKeys(rdb, topic)
+	defer cleanupKeys(rdb, topic)
+
+	ctx := context.Background()
+	rdb.XGroupCreateMkStream(ctx, internal.StreamKey(topic), "test-group", "0")
+
+	e := newTestEngine(t,
+		fxmq.WithMaxRetry(3),
+		fxmq.WithAckTimeout(1*time.Second),
+		fxmq.WithConcurrency(1),
+	)
+	defer e.Shutdown()
+
+	var handlerCalls atomic.Int32
+	handlerStarted := make(chan struct{})
+	handlerUnblock := make(chan struct{})
+
+	err := e.Subscribe(ctx, topic, func(ctx context.Context, msg *fxmq.Message) error {
+		handlerCalls.Add(1)
+		close(handlerStarted)
+		<-handlerUnblock
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.Start(ctx)
+
+	// Publish a message
+	msg, _ := fxmq.NewMessage(topic, map[string]any{"slow": true})
+	if err := e.Publish(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for handler to start
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for handler to start")
+	}
+
+	t.Log("handler started, blocking...")
+
+	// Wait for recovery to XAUTOCLAIM and try retry.
+	// AckTimeout=1s, RecoveryInterval=250ms, so first XAUTOCLAIM at ~1.25s.
+	// Wait enough time for multiple recovery cycles to ensure the lock blocked them all.
+	time.Sleep(5 * time.Second)
+
+	// Handler should still only have been called once (lock prevented retry)
+	calls := handlerCalls.Load()
+	if calls != 1 {
+		t.Fatalf("expected 1 handler call, got %d (lock failed to prevent concurrent processing)", calls)
+	}
+
+	// Verify lock key exists in Redis while handler is running
+	lockKey := internal.LockKey(topic, msg.ID)
+	lockExists, err := rdb.Exists(ctx, lockKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockExists != 1 {
+		t.Fatal("lock key should exist while handler is running")
+	}
+
+	// Verify lock has a reasonable TTL (should be ~MaxRetry*(AckTimeout+RecoveryInterval)+LockBuffer)
+	lockTTL, _ := rdb.TTL(ctx, lockKey).Result()
+	t.Logf("lock TTL while handler running: %v", lockTTL)
+	if lockTTL <= 0 {
+		t.Fatal("lock should have positive TTL")
+	}
+
+	// Unblock the handler
+	close(handlerUnblock)
+
+	// Wait for handler to finish, ACK, and release lock
+	time.Sleep(2 * time.Second)
+
+	// Verify lock was released
+	lockExists, err = rdb.Exists(ctx, lockKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockExists != 0 {
+		t.Fatal("lock key should be released after handler completion")
+	}
+
+	// Verify DLQ entry was cleaned up because handler eventually succeeded
+	dlqKey := internal.DeadLetterKey(topic, "test-group")
+	dlqLen, _ := rdb.XLen(ctx, dlqKey).Result()
+	if dlqLen != 0 {
+		t.Fatalf("DLQ should be empty after handler success, got %d entries", dlqLen)
+	}
+
+	// Retry key should also be cleared
+	retryKey := fmt.Sprintf("fxmq:retry:%s:%s:%s", topic, "test-group", msg.ID)
+	retryExists, _ := rdb.Exists(ctx, retryKey).Result()
+	if retryExists != 0 {
+		t.Fatal("retry key should be cleared after handler success")
+	}
+
+	t.Logf("lock test passed: handler called %d time(s), lock properly acquired and released, DLQ cleaned up", calls)
+}
+
+// TestLockReleasedOnFailure verifies that the lock is released even when the
+// handler returns an error, allowing recovery to retry the message.
+func TestLockReleasedOnFailure(t *testing.T) {
+	topic := "test-lock-failure"
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	defer rdb.Close()
+	cleanupKeys(rdb, topic)
+	defer cleanupKeys(rdb, topic)
+
+	ctx := context.Background()
+	rdb.XGroupCreateMkStream(ctx, internal.StreamKey(topic), "test-group", "0")
+
+	e := newTestEngine(t,
+		fxmq.WithMaxRetry(3),
+		fxmq.WithAckTimeout(2*time.Second),
+		fxmq.WithConcurrency(1),
+	)
+	defer e.Shutdown()
+
+	var attempts atomic.Int32
+	var mu sync.Mutex
+	var firstMsgID string
+
+	err := e.Subscribe(ctx, topic, func(ctx context.Context, msg *fxmq.Message) error {
+		mu.Lock()
+		if firstMsgID == "" {
+			firstMsgID = msg.ID
+		}
+		mu.Unlock()
+		attempts.Add(1)
+		return fmt.Errorf("handler error")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.Start(ctx)
+
+	msg, _ := fxmq.NewMessage(topic, map[string]any{"fail": true})
+	if err := e.Publish(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for handler to process and release lock after failure
+	// Then recovery should XAUTOCLAIM and retry successfully (lock released)
+	time.Sleep(2 * time.Second)
+
+	// After first failure, the handler releases the lock.
+	// Verify lock is NOT present (released after failure).
+	mu.Lock()
+	mid := firstMsgID
+	mu.Unlock()
+	if mid != "" {
+		lockKey := internal.LockKey(topic, mid)
+		exists, _ := rdb.Exists(ctx, lockKey).Result()
+		if exists != 0 {
+			t.Fatal("lock should be released after handler failure")
+		}
+	}
+
+	// Wait for retries to happen (lock is released, so retry should succeed)
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for retries, attempts=%d", attempts.Load())
+		default:
+		}
+		if attempts.Load() >= 2 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Logf("lock released on failure: %d attempts (initial + retry)", attempts.Load())
 }

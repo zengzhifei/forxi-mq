@@ -127,11 +127,12 @@ func (r *Recovery) recover(ctx context.Context, topic string) {
 
 		if count >= r.maxRetry {
 			// Max retries exceeded → move to dead letter queue, don't ACK (leave in PEL for requeue)
-			if err := r.dlq.Push(ctx, &msg, "max retries exceeded (timeout)"); err != nil {
+			dlqEntryID, err := r.dlq.Push(ctx, &msg, "max retries exceeded (timeout)")
+			if err != nil {
 				r.logger.Error("dlq push failed", "topic", topic, "msg_id", xmsg.ID, "error", err)
 				continue
 			}
-			r.retry.MarkDead(ctx, topic, xmsg.ID)
+			r.retry.MarkDead(ctx, topic, xmsg.ID, dlqEntryID)
 			r.logger.Info("message moved to DLQ", "topic", topic, "msg_id", xmsg.ID, "retries", count)
 		} else {
 			// Deliver to consumer via channel for reprocessing

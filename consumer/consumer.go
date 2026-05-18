@@ -15,6 +15,15 @@ import (
 	"github.com/zengzhifei/forxi-mq/retry"
 )
 
+// Lua script for safe lock release: only delete if value matches.
+var releaseLockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+else
+	return 0
+end
+`)
+
 // Handler is the function signature for message processing.
 type Handler func(ctx context.Context, msg *mq.Message) error
 
@@ -25,6 +34,7 @@ type Consumer struct {
 	consumer    string
 	concurrency int
 	ackTimeout  time.Duration
+	lockTTL     time.Duration
 	logger      log.Logger
 	retry       *retry.Strategy
 
@@ -47,12 +57,14 @@ type retryMessage struct {
 
 // New creates a new Consumer.
 func New(rdb *redis.Client, cfg mq.Config, logger log.Logger, rs *retry.Strategy) *Consumer {
+	lockTTL := time.Duration(cfg.MaxRetry)*(cfg.AckTimeout+cfg.RecoveryInterval) + cfg.LockBuffer
 	return &Consumer{
 		rdb:         rdb,
 		group:       cfg.Group,
 		consumer:    cfg.Consumer,
 		concurrency: cfg.Concurrency,
 		ackTimeout:  cfg.AckTimeout,
+		lockTTL:     lockTTL,
 		logger:      logger,
 		retry:       rs,
 		retryCh:     make(chan retryMessage, 100),
@@ -181,6 +193,21 @@ func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis
 		return
 	}
 
+	// Acquire distributed lock to prevent concurrent processing of the same message.
+	lockKey := internal.LockKey(topic, xmsg.ID)
+	lockValue := fmt.Sprintf("%s:%d", c.consumer, time.Now().UnixNano())
+	acquired, err := c.rdb.SetNX(ctx, lockKey, lockValue, c.lockTTL).Result()
+	if err != nil {
+		c.logger.Error("acquire lock failed", "topic", topic, "msg_id", xmsg.ID, "error", err)
+		return
+	}
+	if !acquired {
+		c.logger.Warn("message already being processed, skipping",
+			"topic", topic, "msg_id", xmsg.ID)
+		return
+	}
+	defer c.releaseLock(lockKey, lockValue)
+
 	// Enforce processing timeout to prevent handler from blocking indefinitely.
 	handlerCtx, cancel := context.WithTimeout(ctx, c.ackTimeout)
 	defer cancel()
@@ -190,7 +217,14 @@ func (c *Consumer) process(ctx context.Context, topic, stream string, xmsg redis
 		return
 	}
 
-	// Success: ACK and clear retry counter
+	// Success: ACK and clear retry counter.
+	// If the message was pushed to DLQ while we were processing, clean up the DLQ entry too.
+	if dlqEntryID := c.retry.GetDLQEntryID(ctx, topic, xmsg.ID); dlqEntryID != "" {
+		dlqKey := internal.DeadLetterKey(topic, c.group)
+		if err := c.rdb.XDel(ctx, dlqKey, dlqEntryID).Err(); err != nil {
+			c.logger.Error("dlq cleanup failed", "topic", topic, "dlq_entry", dlqEntryID, "error", err)
+		}
+	}
 	c.ack(ctx, stream, xmsg.ID)
 	c.retry.Clear(ctx, topic, xmsg.ID)
 }
@@ -205,6 +239,15 @@ func (c *Consumer) handleFailure(ctx context.Context, topic, stream string, msg 
 func (c *Consumer) ack(ctx context.Context, stream, id string) {
 	if err := c.rdb.XAck(ctx, stream, c.group, id).Err(); err != nil {
 		c.logger.Error("ack failed", "stream", stream, "id", id, "error", err)
+	}
+}
+
+// releaseLock releases a distributed lock using a Lua script that checks the value
+// before deleting, ensuring we only release our own lock.
+func (c *Consumer) releaseLock(key, value string) {
+	// Use background context: parent ctx may already be cancelled during shutdown.
+	if err := releaseLockScript.Run(context.Background(), c.rdb, []string{key}, value).Err(); err != nil {
+		c.logger.Error("release lock failed", "key", key, "error", err)
 	}
 }
 

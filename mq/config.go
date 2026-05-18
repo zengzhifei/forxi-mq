@@ -36,6 +36,10 @@ type Config struct {
 
 	// DLQ retention: how long dead letter messages are kept (default: 7 days)
 	DLQRetention time.Duration
+
+	// LockBuffer is added to MaxRetry*(AckTimeout+RecoveryInterval) to form the lock TTL.
+	// It guards against handler still running when lock expires. (default: 30s)
+	LockBuffer time.Duration
 }
 
 // defaultConsumerName returns a unique consumer name from environment.
@@ -65,6 +69,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.DLQRetention <= 0 {
 		c.DLQRetention = 7 * 24 * time.Hour
+	}
+	if c.LockBuffer <= 0 {
+		c.LockBuffer = 30 * time.Second
 	}
 	// Internal intervals derived from AckTimeout
 	c.DelayPollInterval = 500 * time.Millisecond

@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -48,10 +49,11 @@ func (s *Strategy) Clear(ctx context.Context, topic, msgID string) {
 	s.rdb.Del(ctx, key)
 }
 
-// MarkDead sets the retry counter to -1, indicating the message is in the dead letter queue.
-func (s *Strategy) MarkDead(ctx context.Context, topic, msgID string) {
+// MarkDead sets the retry counter to -1:<dlqEntryID>, indicating the message is in the DLQ
+// and recording the DLQ entry ID for later cleanup.
+func (s *Strategy) MarkDead(ctx context.Context, topic, msgID, dlqEntryID string) {
 	key := internal.RetryCountKey(topic, s.group, msgID)
-	s.rdb.Set(ctx, key, "-1", s.ttl)
+	s.rdb.Set(ctx, key, "-1:"+dlqEntryID, s.ttl)
 }
 
 // IsDead returns true if the message has been marked as dead.
@@ -61,5 +63,23 @@ func (s *Strategy) IsDead(ctx context.Context, topic, msgID string) bool {
 	if err != nil {
 		return false
 	}
-	return val == "-1"
+	return strings.HasPrefix(val, "-1")
+}
+
+// GetDLQEntryID returns the DLQ entry ID stored in the retry key, or empty string if not found.
+func (s *Strategy) GetDLQEntryID(ctx context.Context, topic, msgID string) string {
+	key := internal.RetryCountKey(topic, s.group, msgID)
+	val, err := s.rdb.Get(ctx, key).Result()
+	if err != nil {
+		return ""
+	}
+	if !strings.HasPrefix(val, "-1") {
+		return ""
+	}
+	// Format: "-1:<dlqEntryID>"
+	idx := strings.Index(val, ":")
+	if idx < 0 {
+		return ""
+	}
+	return val[idx+1:]
 }

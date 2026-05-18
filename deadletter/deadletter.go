@@ -23,30 +23,30 @@ func New(rdb *redis.Client, group string, logger log.Logger) *Queue {
 	return &Queue{rdb: rdb, group: group, logger: logger}
 }
 
-// Push moves a message to the dead letter stream.
-func (q *Queue) Push(ctx context.Context, msg *mq.Message, reason string) error {
+// Push moves a message to the dead letter stream and returns the DLQ entry ID.
+func (q *Queue) Push(ctx context.Context, msg *mq.Message, reason string) (string, error) {
 	body, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	err = q.rdb.XAdd(ctx, &redis.XAddArgs{
+	id, err := q.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: internal.DeadLetterKey(msg.Topic, q.group),
 		Values: map[string]interface{}{
 			"body":   string(body),
 			"reason": reason,
 		},
-	}).Err()
+	}).Result()
 
 	if err != nil {
 		q.logger.Error("failed to push to dead letter queue",
 			"topic", msg.Topic, "msg_id", msg.ID, "error", err)
-		return err
+		return "", err
 	}
 
 	q.logger.Warn("message moved to dead letter queue",
 		"topic", msg.Topic, "msg_id", msg.ID, "reason", reason)
-	return nil
+	return id, nil
 }
 
 // List reads messages from the dead letter queue for inspection.
