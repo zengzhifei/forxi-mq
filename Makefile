@@ -45,6 +45,7 @@ release: frontend build vet
 	git push origin main
 	git push origin $(VERSION)
 	@echo "==> Released $(VERSION)"
+	@echo "https://github.com/zengzhifei/forxi-mq/releases/tag/$(VERSION)"
 
 ## clean: Remove build artifacts
 clean:

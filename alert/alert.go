@@ -3,15 +3,9 @@ package alert
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"strconv"
 	"sync"
 	"time"
 
@@ -144,23 +138,24 @@ func (a *Alerter) check(ctx context.Context) {
 }
 
 func (a *Alerter) send(topic string, reasons []string) {
-	text := fmt.Sprintf("[forxi-mq 告警]\nTopic: %s\n触发条件:\n", topic)
-	for _, r := range reasons {
-		text += "  - " + r + "\n"
+	if a.cfg.Webhook == "" {
+		return
 	}
+
+	now := time.Now()
 
 	var payload []byte
 	var webhookURL string
 
 	switch a.cfg.Type {
 	case "feishu":
-		payload, webhookURL = a.buildFeishu(text)
+		payload, webhookURL = a.buildFeishu(a.buildAlertMarkdown(topic, reasons, now))
 	case "dingtalk":
-		payload, webhookURL = a.buildDingTalk(text)
+		payload, webhookURL = a.buildDingTalk(a.buildAlertText(topic, reasons, now))
 	case "wecom":
-		payload, webhookURL = a.buildWeCom(text)
+		payload, webhookURL = a.buildWeCom(a.buildWeComMarkdown(topic, reasons, now))
 	default:
-		payload, webhookURL = a.buildGeneric(text)
+		payload, webhookURL = a.buildGeneric(a.buildAlertText(topic, reasons, now))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -183,79 +178,24 @@ func (a *Alerter) send(topic string, reasons []string) {
 	a.logger.Info("alert sent", "topic", topic, "status", resp.StatusCode)
 }
 
-// --- Platform-specific builders ---
+// Text builders.
 
-// buildFeishu constructs a Feishu bot payload with optional signature.
-// Sign method: timestamp(sec) + "\n" + secret → HMAC-SHA256 → base64
-func (a *Alerter) buildFeishu(text string) ([]byte, string) {
-	msg := map[string]any{
-		"msg_type": "text",
-		"content":  map[string]string{"text": text},
+func (a *Alerter) buildAlertText(topic string, reasons []string, now time.Time) string {
+	text := fmt.Sprintf("[forxi-mq 告警]\nTopic: %s\n触发条件:\n", topic)
+	for _, r := range reasons {
+		text += "  - " + r + "\n"
 	}
-
-	if a.cfg.Secret != "" {
-		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-		sign := feishuSign(timestamp, a.cfg.Secret)
-		msg["timestamp"] = timestamp
-		msg["sign"] = sign
-	}
-
-	body, _ := json.Marshal(msg)
-	return body, a.cfg.Webhook
+	text += fmt.Sprintf("时间: %s", now.Format("2006-01-02 15:04:05"))
+	return text
 }
 
-// buildDingTalk constructs a DingTalk bot payload with optional signature.
-// Sign method: timestamp(ms) + "\n" + secret → HMAC-SHA256(key=secret) → base64 → URL encode, append to URL
-func (a *Alerter) buildDingTalk(text string) ([]byte, string) {
-	msg := map[string]any{
-		"msgtype": "text",
-		"text":    map[string]string{"content": text},
+func (a *Alerter) buildAlertMarkdown(topic string, reasons []string, _ time.Time) string {
+	md := fmt.Sprintf("**Topic**: %s | **Group**: %s\n\n**触发条件**:\n", topic, a.group)
+	for i, r := range reasons {
+		if i > 0 {
+			md += "\n"
+		}
+		md += fmt.Sprintf("- %s", r)
 	}
-
-	webhookURL := a.cfg.Webhook
-	if a.cfg.Secret != "" {
-		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-		sign := dingtalkSign(timestamp, a.cfg.Secret)
-		webhookURL += "&timestamp=" + timestamp + "&sign=" + url.QueryEscape(sign)
-	}
-
-	body, _ := json.Marshal(msg)
-	return body, webhookURL
-}
-
-// buildWeCom constructs a WeCom (企业微信) bot payload. No signing needed (key is in URL).
-func (a *Alerter) buildWeCom(text string) ([]byte, string) {
-	msg := map[string]any{
-		"msgtype": "text",
-		"text":    map[string]string{"content": text},
-	}
-	body, _ := json.Marshal(msg)
-	return body, a.cfg.Webhook
-}
-
-// buildGeneric constructs a simple JSON POST payload.
-func (a *Alerter) buildGeneric(text string) ([]byte, string) {
-	msg := map[string]any{
-		"text": text,
-	}
-	body, _ := json.Marshal(msg)
-	return body, a.cfg.Webhook
-}
-
-// --- Signing helpers ---
-
-// feishuSign: HMAC-SHA256(key="", msg=timestamp+"\n"+secret) → base64
-func feishuSign(timestamp, secret string) string {
-	stringToSign := timestamp + "\n" + secret
-	h := hmac.New(sha256.New, []byte(stringToSign))
-	h.Write([]byte{})
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
-}
-
-// dingtalkSign: HMAC-SHA256(key=secret, msg=timestamp+"\n"+secret) → base64
-func dingtalkSign(timestamp, secret string) string {
-	stringToSign := timestamp + "\n" + secret
-	h := hmac.New(sha256.New, []byte(secret))
-	h.Write([]byte(stringToSign))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	return md
 }
