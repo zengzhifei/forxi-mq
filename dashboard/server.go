@@ -4,11 +4,10 @@ import (
 	"context"
 	"embed"
 	"io/fs"
+	"log/slog"
 	"net/http"
 
 	"github.com/redis/go-redis/v9"
-
-	"github.com/zengzhifei/forxi-mq/log"
 )
 
 //go:embed ui/dist/*
@@ -18,13 +17,13 @@ var staticFiles embed.FS
 type Server struct {
 	rdb    *redis.Client
 	group  string
-	logger log.Logger
+	logger *slog.Logger
 	addr   string
 	srv    *http.Server
 }
 
 // New creates a new dashboard Server.
-func New(rdb *redis.Client, addr string, group string, logger log.Logger) *Server {
+func New(rdb *redis.Client, addr string, group string, logger *slog.Logger) *Server {
 	return &Server{
 		rdb:    rdb,
 		group:  group,

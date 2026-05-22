@@ -4,7 +4,7 @@ AUTO_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//
 # Capture positional argument (the word after the target)
 ARG := $(filter-out push release clean help build vet test frontend,$(MAKECMDGOALS))
 VERSION = $(or $(ARG),$(AUTO_VERSION))
-MSG = $(ARG)
+MSG =
 
 # Catch-all to prevent "No rule to make target" for positional args
 %::
@@ -26,16 +26,16 @@ frontend:
 
 ## push: Commit and push code (usage: make push 'message')
 push:
-	@if [ -z "$(MSG)" ]; then echo "Usage: make push 'commit message'"; exit 1; fi
+	@if [ -z "$(ARG)" ]; then echo "Usage: make push 'commit message'"; exit 1; fi
 	git add .
-	git commit -m "$(MSG)"
+	git commit -m "$(ARG)"
 	git push origin main
 
-## release: Build, bump version, tag, push (usage: make release [version])
+## release: Build, bump version, tag, push (usage: make release [version] [MSG='message'])
 release: frontend build vet
 	@echo "==> Releasing $(VERSION)"
 	git add .
-	git commit -m "release: $(VERSION)"
+	git commit -m "$(or $(MSG),release: $(VERSION))"
 	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
 		echo "==> Tag $(VERSION) exists, replacing..."; \
 		git tag -d "$(VERSION)"; \

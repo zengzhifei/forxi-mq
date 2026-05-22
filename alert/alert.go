@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,7 +18,6 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/internal"
-	"github.com/zengzhifei/forxi-mq/log"
 )
 
 // Config configures the alert system.
@@ -61,14 +61,14 @@ type Alerter struct {
 	cfg    Config
 	group  string
 	topics []string
-	logger log.Logger
+	logger *slog.Logger
 
 	mu       sync.Mutex
 	lastSent map[string]time.Time // topic -> last alert time
 }
 
 // New creates a new Alerter.
-func New(rdb *redis.Client, topics []string, group string, cfg Config, logger log.Logger) *Alerter {
+func New(rdb *redis.Client, topics []string, group string, cfg Config, logger *slog.Logger) *Alerter {
 	cfg.applyDefaults()
 	return &Alerter{
 		rdb:      rdb,

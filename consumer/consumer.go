@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/internal"
-	"github.com/zengzhifei/forxi-mq/log"
 	"github.com/zengzhifei/forxi-mq/mq"
 	"github.com/zengzhifei/forxi-mq/retry"
 )
@@ -35,7 +35,7 @@ type Consumer struct {
 	concurrency int
 	ackTimeout  time.Duration
 	lockTTL     time.Duration
-	logger      log.Logger
+	logger      *slog.Logger
 	retry       *retry.Strategy
 
 	mu      sync.Mutex
@@ -56,7 +56,7 @@ type retryMessage struct {
 }
 
 // New creates a new Consumer.
-func New(rdb *redis.Client, cfg mq.Config, logger log.Logger, rs *retry.Strategy) *Consumer {
+func New(rdb *redis.Client, cfg mq.Config, logger *slog.Logger, rs *retry.Strategy) *Consumer {
 	lockTTL := time.Duration(cfg.MaxRetry)*(cfg.AckTimeout+cfg.RecoveryInterval) + cfg.LockBuffer
 	return &Consumer{
 		rdb:         rdb,

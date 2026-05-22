@@ -192,7 +192,7 @@ engine, _ := fxmq.NewEngine("localhost:6379", "my-service",
     fxmq.WithAlert(fxmq.AlertConfig{...}),      // 开启 Webhook 告警
     fxmq.WithRedisPassword("secret"),           // Redis 密码
     fxmq.WithRedisDB(1),                        // Redis DB
-    fxmq.WithLogger(customLogger),              // 自定义日志
+    fxmq.WithLogger(customLogger),              // 自定义日志（*slog.Logger）
 )
 ```
 
@@ -287,18 +287,23 @@ forxi-mq 提供 **at-least-once** 语义：
 
 ## 自定义日志
 
-实现 `log.Logger` 接口即可替换内置日志：
+forxi-mq 直接使用标准库 `*slog.Logger`（Go 1.21+），无需额外依赖或手写适配器：
 
 ```go
-type Logger interface {
-    Info(msg string, args ...any)
-    Warn(msg string, args ...any)
-    Error(msg string, args ...any)
-    Debug(msg string, args ...any)
-}
+import "log/slog"
+
+engine, _ := fxmq.NewEngine(addr, group,
+    fxmq.WithLogger(slog.Default()),
+)
 ```
 
-兼容 `slog`、`zap`（需简单封装）、`zerolog` 等主流日志库。
+接入其他主流日志库通过对应的 slog Handler 桥接即可：
+
+- **zap**：`slog.New(zapslog.NewHandler(zapLogger.Core()))`（来自 `go.uber.org/zap/exp/zapslog`）
+- **zerolog**：`slog.New(slogzerolog.Option{Logger: &zl}.NewZerologHandler())`（来自 `samber/slog-zerolog`）
+- **logrus**：`slog.New(slogrus.Option{Logger: lg}.NewLogrusHandler())`（来自 `samber/slog-logrus`）
+
+不传 `WithLogger` 时使用默认 logger：JSON 格式、写到 stderr、Info 级别。
 
 ## 项目结构
 
@@ -314,7 +319,7 @@ forxi-mq/
 ├── recovery/              # 超时消息恢复（XAUTOCLAIM + 重发）
 ├── alert/                 # Webhook 告警（飞书/钉钉/企微）
 ├── dashboard/             # Web Dashboard（Vue 3 + Element Plus）
-├── log/                   # 日志接口
+├── log/                   # 默认 *slog.Logger 构造器
 ├── internal/              # Redis Key 命名
 └── examples/              # 使用示例
 ```

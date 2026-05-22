@@ -3,13 +3,13 @@ package recovery
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/deadletter"
 	"github.com/zengzhifei/forxi-mq/internal"
-	"github.com/zengzhifei/forxi-mq/log"
 	"github.com/zengzhifei/forxi-mq/mq"
 	"github.com/zengzhifei/forxi-mq/retry"
 )
@@ -28,14 +28,14 @@ type Recovery struct {
 	maxRetry   int
 	ackTimeout time.Duration
 	interval   time.Duration
-	logger     log.Logger
+	logger     *slog.Logger
 	retry      *retry.Strategy
 	dlq        *deadletter.Queue
 	enqueuer   RetryEnqueuer
 }
 
 // New creates a new Recovery process.
-func New(rdb *redis.Client, cfg mq.Config, topics []string, logger log.Logger, rs *retry.Strategy, dlq *deadletter.Queue, enqueuer RetryEnqueuer) *Recovery {
+func New(rdb *redis.Client, cfg mq.Config, topics []string, logger *slog.Logger, rs *retry.Strategy, dlq *deadletter.Queue, enqueuer RetryEnqueuer) *Recovery {
 	return &Recovery{
 		rdb:        rdb,
 		group:      cfg.Group,

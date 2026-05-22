@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -78,8 +79,10 @@ func WithRedisDB(db int) Option {
 	return func(e *Engine) { e.cfg.RedisDB = db }
 }
 
-// WithLogger sets a custom logger.
-func WithLogger(l log.Logger) Option {
+// WithLogger sets a custom logger. Pass any *slog.Logger; structured loggers
+// such as zap (via go.uber.org/zap/exp/zapslog) can be bridged into slog
+// without a hand-written adapter.
+func WithLogger(l *slog.Logger) Option {
 	return func(e *Engine) { e.logger = l }
 }
 
@@ -95,9 +98,9 @@ func WithAlert(cfg alert.Config) Option {
 
 // Engine is the top-level entry point that wires all components together.
 type Engine struct {
-	rdb   *redis.Client
-	cfg   Config
-	logger log.Logger
+	rdb    *redis.Client
+	cfg    Config
+	logger *slog.Logger
 
 	Producer *producer.Producer
 	Consumer *consumer.Consumer
@@ -143,7 +146,7 @@ func NewEngine(redisAddr, group string, opts ...Option) (*Engine, error) {
 
 	// Default logger
 	if e.logger == nil {
-		e.logger = log.New()
+		e.logger = log.Default()
 	}
 
 	return e, nil

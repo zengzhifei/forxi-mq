@@ -1,44 +1,27 @@
+// Package log provides default *slog.Logger constructors used by the engine
+// when the caller does not supply one via WithLogger.
+//
+// The library uses the standard library log/slog.Logger as its logging
+// contract. Any structured logger that exposes a slog.Handler (zap via
+// go.uber.org/zap/exp/zapslog, zerolog via samber/slog-zerolog, logrus via
+// samber/slog-logrus, etc.) can be plugged in without an adapter.
 package log
 
 import (
+	"io"
 	"log/slog"
 	"os"
 )
 
-// Logger is the interface for structured logging.
-// Any implementation (e.g. zap, zerolog) can satisfy this interface.
-type Logger interface {
-	Info(msg string, args ...any)
-	Warn(msg string, args ...any)
-	Error(msg string, args ...any)
-	Debug(msg string, args ...any)
+// Default returns a JSON slog logger writing to stderr at info level. This is
+// the logger used by the engine when no WithLogger option is supplied.
+func Default() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 }
 
-// Nop returns a no-op logger that discards all output.
-func Nop() Logger { return &nopLogger{} }
-
-type nopLogger struct{}
-
-func (n *nopLogger) Info(string, ...any)  {}
-func (n *nopLogger) Warn(string, ...any)  {}
-func (n *nopLogger) Error(string, ...any) {}
-func (n *nopLogger) Debug(string, ...any) {}
-
-// New creates a default structured logger writing JSON to stderr.
-func New() Logger {
-	return &defaultLogger{
-		l: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
-		})),
-	}
+// Nop returns a logger that discards all output. Useful for tests.
+func Nop() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
-
-// defaultLogger wraps slog.
-type defaultLogger struct {
-	l *slog.Logger
-}
-
-func (d *defaultLogger) Info(msg string, args ...any)  { d.l.Info(msg, args...) }
-func (d *defaultLogger) Warn(msg string, args ...any)  { d.l.Warn(msg, args...) }
-func (d *defaultLogger) Error(msg string, args ...any) { d.l.Error(msg, args...) }
-func (d *defaultLogger) Debug(msg string, args ...any) { d.l.Debug(msg, args...) }

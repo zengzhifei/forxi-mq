@@ -3,11 +3,11 @@ package deadletter
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/internal"
-	"github.com/zengzhifei/forxi-mq/log"
 	"github.com/zengzhifei/forxi-mq/mq"
 )
 
@@ -15,11 +15,11 @@ import (
 type Queue struct {
 	rdb    *redis.Client
 	group  string
-	logger log.Logger
+	logger *slog.Logger
 }
 
 // New creates a new dead letter Queue.
-func New(rdb *redis.Client, group string, logger log.Logger) *Queue {
+func New(rdb *redis.Client, group string, logger *slog.Logger) *Queue {
 	return &Queue{rdb: rdb, group: group, logger: logger}
 }
 

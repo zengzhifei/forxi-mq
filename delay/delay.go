@@ -2,13 +2,13 @@ package delay
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/zengzhifei/forxi-mq/internal"
-	"github.com/zengzhifei/forxi-mq/log"
 )
 
 // transferScript atomically pops due messages from ZSET, reads body from Hash,
@@ -58,11 +58,11 @@ type Poller struct {
 	interval     time.Duration
 	streamMaxLen int64
 	mapTTL       time.Duration
-	logger       log.Logger
+	logger       *slog.Logger
 }
 
 // New creates a new delay Poller.
-func New(rdb *redis.Client, topics []string, interval time.Duration, streamMaxLen int64, mapTTL time.Duration, logger log.Logger) *Poller {
+func New(rdb *redis.Client, topics []string, interval time.Duration, streamMaxLen int64, mapTTL time.Duration, logger *slog.Logger) *Poller {
 	return &Poller{
 		rdb:          rdb,
 		topics:       topics,
